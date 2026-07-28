@@ -50,6 +50,40 @@ def probe_video(path: Path) -> MediaInfo:
         raise MediaError(f"Could not parse ffprobe output for {path}") from exc
 
 
+def extract_audio(video_path: Path, output_path: Path) -> Path:
+    """Save a browser-compatible AAC/M4A copy of the source audio."""
+    require_media_tools()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.part.m4a")
+    temporary.unlink(missing_ok=True)
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(temporary),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        temporary.unlink(missing_ok=True)
+        detail = completed.stderr.strip() or "source video has no usable audio stream"
+        raise MediaError(f"FFmpeg audio extraction failed: {detail}")
+    temporary.replace(output_path)
+    return output_path
+
+
 def extract_frames(video_path: Path, frames_dir: Path, roi: Roi, fps: float) -> list[FrameRef]:
     require_media_tools()
     frames_dir.mkdir(parents=True, exist_ok=True)

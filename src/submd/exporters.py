@@ -28,15 +28,20 @@ def format_timestamp(milliseconds: int) -> str:
     return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
-def export_markdown(document: SubtitleDocument, output_dir: Path, overwrite: bool) -> Path:
+def export_markdown(
+    document: SubtitleDocument,
+    output_dir: Path,
+    overwrite: bool,
+    name_suffix: str = "",
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = sanitize_filename(document.video.original_title)
-    path = output_dir / f"{stem}.md"
+    path = output_dir / f"{stem}{name_suffix}.md"
     if path.exists() and not overwrite:
-        path = output_dir / f"{stem} [{document.video.video_id}].md"
+        path = output_dir / f"{stem}{name_suffix} [{document.video.video_id}].md"
         counter = 2
         while path.exists():
-            path = output_dir / f"{stem} [{document.video.video_id}-{counter}].md"
+            path = output_dir / f"{stem}{name_suffix} [{document.video.video_id}-{counter}].md"
             counter += 1
 
     metadata = document.video
@@ -45,7 +50,11 @@ def export_markdown(document: SubtitleDocument, output_dir: Path, overwrite: boo
         f"title: {json.dumps(metadata.original_title, ensure_ascii=False)}",
         f"video_id: {json.dumps(metadata.video_id)}",
         f"source_url: {json.dumps(metadata.webpage_url, ensure_ascii=False)}",
-        'subtitle_source: "burned_ocr"',
+        (
+            'subtitle_source: "burned_ocr+youtube_reading_reference"'
+            if any(segment.source == "burned_ocr_corrected" for segment in document.segments)
+            else 'subtitle_source: "burned_ocr"'
+        ),
         'ocr_backend: "cloud_vlm"',
         f"ocr_model: {json.dumps(document.config.ocr.model, ensure_ascii=False)}",
         f"language: {json.dumps(document.config.language)}",

@@ -164,6 +164,8 @@ def extract(
         raise typer.Exit(code=1) from exc
 
     typer.secho(f"Markdown：{result.markdown_path}", fg=typer.colors.GREEN)
+    if result.audio_path:
+        typer.echo(f"音频：{result.audio_path}")
     typer.echo(f"segments.json：{result.segments_path}")
     typer.echo(f"api_calls.json：{result.api_calls_path}")
     typer.echo(f"识别观察 {result.observation_count} 个，合并字幕段 {result.segment_count} 个。")
@@ -246,6 +248,8 @@ def organize(
         raise typer.Exit(code=1) from exc
 
     typer.secho(f"整理版 Markdown：{result.markdown_path}", fg=typer.colors.GREEN)
+    if result.sentences_path:
+        typer.echo(f"句子时间轴：{result.sentences_path}")
     typer.echo(f"断句检查点：{result.checkpoint_path}")
     typer.echo(
         f"原字幕片段 {result.source_fragment_count} 个，整理为 {result.sentence_count} 句话；"

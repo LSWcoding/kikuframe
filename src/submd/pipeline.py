@@ -3,11 +3,18 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Callable
+from pathlib import Path
 
 from submd.exporters import export_markdown
 from submd.json_io import write_json
-from submd.media import extract_frames, probe_video, select_ocr_frames
-from submd.models import ExtractionConfig, ExtractionResult, OcrObservation, SubtitleDocument
+from submd.media import extract_audio, extract_frames, probe_video, select_ocr_frames
+from submd.models import (
+    ExtractionConfig,
+    ExtractionResult,
+    OcrObservation,
+    SubtitleDocument,
+    YouTubeCaptionTrack,
+)
 from submd.ocr.base import OcrEngine
 from submd.ocr.openai_compatible import OpenAICompatibleOcrEngine
 from submd.segments import build_segments
@@ -161,6 +168,8 @@ class BurnedSubtitlePipeline:
         markdown_path = export_markdown(
             document, config.output_dir.expanduser().resolve(), config.overwrite
         )
+        self.status("保存视频音频…")
+        audio_path = extract_audio(video_path, markdown_path.with_suffix(".m4a"))
 
         if not config.keep_cache:
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -176,7 +185,64 @@ class BurnedSubtitlePipeline:
             markdown_path=markdown_path,
             segment_count=len(segments),
             observation_count=len(observations),
+            audio_path=audio_path,
         )
+
+    def ensure_audio(self, config: ExtractionConfig, raw_markdown_path: Path) -> Path:
+        """Create the audio sidecar for a reusable OCR result without rerunning OCR."""
+        raw_markdown_path = raw_markdown_path.expanduser().resolve()
+        audio_path = raw_markdown_path.with_suffix(".m4a")
+        if audio_path.is_file():
+            self.status(f"复用已保存音频：{audio_path.name}")
+            return audio_path
+
+        self.status("已有字幕缺少音频；只下载音视频源，不会重新执行视觉 OCR…")
+        metadata = self.downloader.inspect(
+            config.source_url, cookies_from_browser=config.cookies_from_browser
+        )
+        cache_dir = config.workspace_root.expanduser().resolve() / metadata.video_id / "cache"
+        cached_videos = sorted(
+            path
+            for path in cache_dir.glob("source.*")
+            if path.is_file() and path.suffix not in {".part", ".ytdl"}
+        )
+        if cached_videos:
+            video_path = cached_videos[0]
+            self.status(f"复用已下载视频：{video_path.name}")
+        else:
+            video_path, _metadata = self.downloader.download(
+                config.source_url,
+                cache_dir,
+                config.max_height,
+                cookies_from_browser=config.cookies_from_browser,
+            )
+        result = extract_audio(video_path, audio_path)
+        if not config.keep_cache:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        return result
+
+    def ensure_youtube_captions(
+        self,
+        config: ExtractionConfig,
+        video_id: str,
+        language_hint: str,
+    ) -> tuple[YouTubeCaptionTrack | None, Path]:
+        path = config.workspace_root.expanduser().resolve() / video_id / "youtube_captions.json"
+        self.status("读取 YouTube 字幕作为读音参考…")
+        track = self.downloader.fetch_caption_track(
+            config.source_url,
+            path,
+            language_hint=language_hint,
+            cookies_from_browser=config.cookies_from_browser,
+        )
+        if track is None:
+            self.status("该视频没有可用的 YouTube 字幕；继续使用纯 OCR 结果")
+        else:
+            source_label = "人工字幕" if track.source == "manual" else "自动字幕"
+            self.status(
+                f"已取得 YouTube {source_label}（{track.language}，{len(track.cues)} 条）"
+            )
+        return track, path
 
     @staticmethod
     def _load_observations(path, selected, model: str) -> list[OcrObservation]:

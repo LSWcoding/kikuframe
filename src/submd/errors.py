@@ -20,3 +20,7 @@ class OcrError(SubmdError):
 
 class OrganizeError(SubmdError):
     """Subtitle Markdown cleanup or semantic sentence organization failed."""
+
+
+class LearningAnalysisError(SubmdError):
+    """A language-learning sentence analysis request failed."""

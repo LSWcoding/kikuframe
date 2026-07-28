@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,14 +20,27 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from dotenv import dotenv_values, set_key
 
+from submd.editing import apply_manual_resegmentation
 from submd.errors import SubmdError
-from submd.json_io import write_json
-from submd.models import CloudOcrConfig, ExtractionConfig, TextLlmConfig
-from submd.organize import SubtitleOrganizer
+from submd.exporters import export_markdown
+from submd.fusion import SubtitleFusion, infer_caption_language
+from submd.json_io import write_json, write_text
+from submd.learning import SentenceAnalyzer
+from submd.models import (
+    CloudOcrConfig,
+    ExtractionConfig,
+    LanguageLearningConfig,
+    OrganizedSubtitleDocument,
+    SubtitleDocument,
+    TextLlmConfig,
+    YouTubeCaptionTrack,
+)
+from submd.organize import SubtitleOrganizer, write_fallback_player_document
 from submd.pipeline import BurnedSubtitlePipeline
 
 PipelineFactory = Callable[[Callable[[str], None], str], BurnedSubtitlePipeline]
 OrganizerFactory = Callable[[Callable[[str], None], str], SubtitleOrganizer]
+AnalyzerFactory = Callable[[str], SentenceAnalyzer]
 
 _ENV_FIELDS = (
     "SUBMD_YOUTUBE_URL",
@@ -36,8 +50,12 @@ _ENV_FIELDS = (
     "SUBMD_YOUTUBE_COOKIES_FROM_BROWSER",
     "SUBMD_TEXT_BASE_URL",
     "SUBMD_TEXT_MODEL",
+    "SUBMD_LEARNING_BASE_URL",
+    "SUBMD_LEARNING_MODEL",
+    "SUBMD_LEARNING_API_KEY",
 )
-_SECRET_FIELD = "SUBMD_OCR_API_KEY"
+_PRIMARY_SECRET_FIELD = "SUBMD_OCR_API_KEY"
+_SECRET_FIELDS = {_PRIMARY_SECRET_FIELD, "SUBMD_LEARNING_API_KEY"}
 _MAX_REQUEST_BYTES = 64 * 1024
 
 
@@ -62,8 +80,9 @@ class EnvironmentStore:
 
     def read_public(self) -> dict[str, Any]:
         values = self.read_private()
-        return {key: value for key, value in values.items() if key != _SECRET_FIELD} | {
-            "SUBMD_OCR_API_KEY_CONFIGURED": bool(values[_SECRET_FIELD])
+        return {key: value for key, value in values.items() if key not in _SECRET_FIELDS} | {
+            "SUBMD_OCR_API_KEY_CONFIGURED": bool(values[_PRIMARY_SECRET_FIELD]),
+            "SUBMD_LEARNING_API_KEY_CONFIGURED": bool(values["SUBMD_LEARNING_API_KEY"]),
         }
 
     def update(self, submitted: dict[str, Any]) -> dict[str, str]:
@@ -76,7 +95,7 @@ class EnvironmentStore:
                 if value is None:
                     continue
                 clean = str(value).strip()
-                if key == _SECRET_FIELD and not clean and current.get(key):
+                if key in _SECRET_FIELDS and not clean and current.get(key):
                     continue
                 set_key(str(self.path), key, clean, quote_mode="always")
         return self.read_private()
@@ -88,12 +107,14 @@ class ExtractionJobManager:
         project_root: Path,
         pipeline_factory: PipelineFactory | None = None,
         organizer_factory: OrganizerFactory | None = None,
+        analyzer_factory: AnalyzerFactory | None = None,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.environment = EnvironmentStore(self.project_root / ".env")
         self.history_path = self.project_root / "workspace" / "ui_history.json"
         self.pipeline_factory = pipeline_factory or self._default_pipeline
         self.organizer_factory = organizer_factory or self._default_organizer
+        self.analyzer_factory = analyzer_factory or self._default_analyzer
         self._lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._history = self._load_history()
@@ -105,6 +126,10 @@ class ExtractionJobManager:
     @staticmethod
     def _default_organizer(status: Callable[[str], None], api_key: str) -> SubtitleOrganizer:
         return SubtitleOrganizer(status=status, api_key=api_key)
+
+    @staticmethod
+    def _default_analyzer(api_key: str) -> SentenceAnalyzer:
+        return SentenceAnalyzer(api_key=api_key)
 
     def config(self) -> dict[str, Any]:
         return self.environment.read_public()
@@ -120,7 +145,7 @@ class ExtractionJobManager:
             if key not in submitted:
                 continue
             clean = str(submitted[key]).strip()
-            if key == _SECRET_FIELD and not clean and current.get(key):
+            if key in _SECRET_FIELDS and not clean and current.get(key):
                 continue
             candidate[key] = clean
         self._validate_required(candidate)
@@ -140,6 +165,8 @@ class ExtractionJobManager:
             "result_name": None,
             "result_path": None,
             "results": [],
+            "audio_path": None,
+            "sentences_path": None,
         }
         with self._lock:
             self._jobs[job_id] = record
@@ -193,55 +220,300 @@ class ExtractionJobManager:
             raise FileNotFoundError(job_id)
         return path
 
+    def player_data(self, job_id: str) -> dict[str, Any]:
+        record = self._record(job_id)
+        self._validated_project_file(record.get("audio_path"), "output")
+        sentences_path = self._validated_project_file(record.get("sentences_path"), "workspace")
+        try:
+            document = OrganizedSubtitleDocument.model_validate_json(
+                sentences_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError(job_id) from exc
+        raw_name = str(record.get("result_name") or document.source_markdown)
+        return {
+            "title": Path(raw_name).stem,
+            "sentence_count": len(document.sentences),
+            "audio_url": f"/api/player/{job_id}/audio",
+            "analysis_url": f"/api/player/{job_id}/analysis",
+            "resegment_url": f"/api/player/{job_id}/resegment",
+            "sentences": [sentence.model_dump() for sentence in document.sentences],
+        }
+
+    def resegment_sentences(
+        self, job_id: str, sentence_ids: list[str], edited_text: str
+    ) -> dict[str, Any]:
+        if not isinstance(sentence_ids, list) or not all(
+            isinstance(item, str) for item in sentence_ids
+        ):
+            raise ValueError("sentence_ids 必须是句子 ID 数组")
+        if not isinstance(edited_text, str) or not edited_text.strip():
+            raise ValueError("请输入修改后的断句文本")
+        record = self._record(job_id)
+        sentences_path = self._validated_project_file(record.get("sentences_path"), "workspace")
+        organized_result = next(
+            (item for item in record.get("results", []) if item.get("kind") == "organized"),
+            None,
+        )
+        if not organized_result or not organized_result.get("path"):
+            raise FileNotFoundError("organized")
+        organized_path = self._validated_project_file(organized_result["path"], "output")
+        try:
+            document = OrganizedSubtitleDocument.model_validate_json(
+                sentences_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("当前播放器字幕数据已损坏") from exc
+        selected_before = [
+            sentence.model_dump(mode="json")
+            for sentence in document.sentences
+            if sentence.sentence_id in set(sentence_ids)
+        ]
+        source_document = self._load_source_document(
+            str(record.get("source_url") or ""), prefer_corrected=True
+        )
+        updated = apply_manual_resegmentation(
+            document,
+            sentence_ids,
+            edited_text,
+            source_segments=source_document.segments if source_document else None,
+        )
+        write_json(sentences_path, updated)
+        write_text(
+            organized_path,
+            "\n".join(sentence.text for sentence in updated.sentences) + "\n",
+        )
+        self._append_manual_edit(
+            job_id=job_id,
+            record=record,
+            sentence_ids=sentence_ids,
+            edited_text=edited_text,
+            before=selected_before,
+            after=[sentence.model_dump(mode="json") for sentence in updated.sentences],
+        )
+        self._update_persisted_record(
+            job_id,
+            message=f"手动断句已保存：当前共 {len(updated.sentences)} 句话",
+        )
+        return self.player_data(job_id) | {"saved": True}
+
+    def analyze_sentence(
+        self, job_id: str, sentence_id: str, force: bool = False
+    ) -> dict[str, Any]:
+        if not sentence_id.strip():
+            raise ValueError("请选择要分析的句子")
+        record = self._record(job_id)
+        sentences_path = self._validated_project_file(record.get("sentences_path"), "workspace")
+        try:
+            document = OrganizedSubtitleDocument.model_validate_json(
+                sentences_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError(job_id) from exc
+        sentence = next(
+            (item for item in document.sentences if item.sentence_id == sentence_id), None
+        )
+        if sentence is None:
+            raise ValueError("该句子不属于当前视频")
+
+        values = self.environment.read_private()
+        base_url = (
+            values["SUBMD_LEARNING_BASE_URL"]
+            or values["SUBMD_TEXT_BASE_URL"]
+            or values["SUBMD_OCR_BASE_URL"]
+        )
+        model = (
+            values["SUBMD_LEARNING_MODEL"]
+            or values["SUBMD_TEXT_MODEL"]
+            or values["SUBMD_OCR_MODEL"]
+        )
+        api_key = values["SUBMD_LEARNING_API_KEY"] or values[_PRIMARY_SECRET_FIELD]
+        if not base_url or not model or not api_key:
+            raise ValueError("请先配置语言学习模型的地址、模型名称和 API Key")
+        analyzer = self.analyzer_factory(api_key)
+        analysis, cached = analyzer.analyze(
+            sentence=sentence.text,
+            config=LanguageLearningConfig(base_url=base_url, model=model),
+            cache_root=self.project_root / "workspace" / "learning",
+            force=force,
+        )
+        return analysis.model_dump(mode="json") | {
+            "sentence_id": sentence.sentence_id,
+            "cached": cached,
+        }
+
+    def player_audio_file(self, job_id: str) -> Path:
+        return self._validated_project_file(self._record(job_id).get("audio_path"), "output")
+
+    def _append_manual_edit(
+        self,
+        job_id: str,
+        record: dict[str, Any],
+        sentence_ids: list[str],
+        edited_text: str,
+        before: list[dict[str, Any]],
+        after: list[dict[str, Any]],
+    ) -> None:
+        video_id = self._youtube_video_id(str(record.get("source_url") or ""))
+        stem = video_id or hashlib.sha256(job_id.encode()).hexdigest()[:16]
+        path = self.project_root / "workspace" / "manual-edits" / f"{stem}.json"
+        entries: list[dict[str, Any]] = []
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    entries = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        entries.append(
+            {
+                "edited_at": _now(),
+                "job_id": job_id,
+                "selected_sentence_ids": sentence_ids,
+                "edited_text": edited_text,
+                "selected_before": before,
+                "document_after": after,
+            }
+        )
+        write_json(path, entries)
+
+    def _update_persisted_record(self, job_id: str, **changes: Any) -> None:
+        with self._lock:
+            if job_id in self._jobs:
+                self._jobs[job_id].update(changes)
+            for index, item in enumerate(self._history):
+                if item.get("job_id") == job_id:
+                    self._history[index] = dict(item) | changes
+                    break
+            self._persist_history_locked()
+
+    def _record(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            record = self._jobs.get(job_id) or next(
+                (item for item in self._history if item.get("job_id") == job_id), None
+            )
+            if record is None:
+                raise KeyError(job_id)
+            return dict(record)
+
+    def _validated_project_file(self, raw_path: Any, root_name: str) -> Path:
+        if not raw_path:
+            raise FileNotFoundError(root_name)
+        path = Path(str(raw_path)).expanduser().resolve()
+        allowed_root = (self.project_root / root_name).resolve()
+        if not path.is_relative_to(allowed_root) or not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
     def _run(self, job_id: str, values: dict[str, str]) -> None:
         def status(message: str) -> None:
             self._update_job(job_id, message=message)
 
         raw_path: Path | None = None
+        audio_path: Path | None = None
+        sentences_path: Path | None = None
         raw_results: list[dict[str, str]] = []
         try:
+            config = ExtractionConfig(
+                source_url=values["SUBMD_YOUTUBE_URL"],
+                cookies_from_browser=values["SUBMD_YOUTUBE_COOKIES_FROM_BROWSER"] or None,
+                workspace_root=self.project_root / "workspace",
+                output_dir=self.project_root / "output",
+                ocr=CloudOcrConfig(
+                    base_url=values["SUBMD_OCR_BASE_URL"],
+                    model=values["SUBMD_OCR_MODEL"],
+                    batch_size=16,
+                ),
+            )
+            pipeline = self.pipeline_factory(status, values[_PRIMARY_SECRET_FIELD])
             raw_path = self._find_reusable_raw(values["SUBMD_YOUTUBE_URL"])
             if raw_path is None:
-                config = ExtractionConfig(
-                    source_url=values["SUBMD_YOUTUBE_URL"],
-                    cookies_from_browser=values["SUBMD_YOUTUBE_COOKIES_FROM_BROWSER"] or None,
-                    workspace_root=self.project_root / "workspace",
-                    output_dir=self.project_root / "output",
-                    ocr=CloudOcrConfig(
-                        base_url=values["SUBMD_OCR_BASE_URL"],
-                        model=values["SUBMD_OCR_MODEL"],
-                        batch_size=16,
-                    ),
-                )
-                pipeline = self.pipeline_factory(status, values[_SECRET_FIELD])
                 extraction = pipeline.run(config)
                 raw_path = extraction.markdown_path.resolve()
+                audio_path = extraction.audio_path.resolve() if extraction.audio_path else None
                 extract_message = f"OCR 完成：{extraction.segment_count} 个字幕段；正在语义断句…"
             else:
-                extract_message = "找到该视频已有的原始字幕，已跳过下载和视觉 OCR；正在语义断句…"
+                audio_path = self._find_reusable_audio(values["SUBMD_YOUTUBE_URL"], raw_path)
+                if audio_path is None and hasattr(pipeline, "ensure_audio"):
+                    audio_path = pipeline.ensure_audio(config, raw_path).resolve()
+                extract_message = (
+                    "找到该视频已有的原始字幕，已跳过视觉 OCR；正在语义断句…"
+                )
 
             raw_results = [self._result_entry("raw", "原始字幕（含时间戳）", raw_path)]
+            if audio_path is not None and audio_path.is_file():
+                raw_results.append(self._result_entry("audio", "视频音频（M4A）", audio_path))
             self._update_job(
                 job_id,
                 message=extract_message,
                 result_name=raw_path.name,
                 result_path=str(raw_path),
                 results=raw_results,
+                audio_path=str(audio_path) if audio_path else None,
             )
 
             text_config = TextLlmConfig(
                 base_url=values["SUBMD_TEXT_BASE_URL"] or values["SUBMD_OCR_BASE_URL"],
                 model=values["SUBMD_TEXT_MODEL"] or values["SUBMD_OCR_MODEL"],
             )
-            organizer = self.organizer_factory(status, values[_SECRET_FIELD])
+            organizer_source = raw_path
+            reference_track: YouTubeCaptionTrack | None = None
+            source_document = self._load_source_document(values["SUBMD_YOUTUBE_URL"])
+            if source_document is not None and hasattr(pipeline, "ensure_youtube_captions"):
+                language_hint = (
+                    config.language
+                    if config.language.lower() != "auto"
+                    else infer_caption_language(source_document)
+                )
+                reference_track, _caption_path = pipeline.ensure_youtube_captions(
+                    config,
+                    source_document.video.video_id,
+                    language_hint,
+                )
+                if reference_track is not None:
+                    job_dir = (
+                        self.project_root / "workspace" / source_document.video.video_id
+                    )
+                    corrected_document = SubtitleFusion(
+                        api_key=values[_PRIMARY_SECRET_FIELD], status=status
+                    ).run(
+                        document=source_document,
+                        track=reference_track,
+                        config=text_config,
+                        output_path=job_dir / "corrected_segments.json",
+                        checkpoint_path=job_dir / "fusion_checkpoint.json",
+                    )
+                    organizer_source = export_markdown(
+                        corrected_document,
+                        self.project_root / "output",
+                        overwrite=True,
+                        name_suffix="（综合校正版）",
+                    ).resolve()
+                    raw_results.append(
+                        self._result_entry(
+                            "corrected",
+                            "OCR + YouTube 读音参考（含时间戳）",
+                            organizer_source,
+                        )
+                    )
+                    self._update_job(job_id, results=raw_results)
+            organizer = self.organizer_factory(status, values[_PRIMARY_SECRET_FIELD])
+            organize_kwargs: dict[str, Any] = {
+                "source_path": organizer_source,
+                "config": text_config,
+                "workspace_root": self.project_root / "workspace",
+                "output_dir": self.project_root / "output",
+                "overwrite": True,
+            }
+            if reference_track is not None:
+                organize_kwargs["reference_track"] = reference_track
             organized = organizer.run(
-                source_path=raw_path,
-                config=text_config,
-                workspace_root=self.project_root / "workspace",
-                output_dir=self.project_root / "output",
-                overwrite=True,
+                **organize_kwargs,
             )
             organized_path = organized.markdown_path.resolve()
+            sentences_path = (
+                organized.sentences_path.resolve() if organized.sentences_path else None
+            )
             results = [
                 *raw_results,
                 self._result_entry("organized", "整理版（只含字幕）", organized_path),
@@ -249,14 +521,33 @@ class ExtractionJobManager:
             self._finish_job(
                 job_id,
                 status="succeeded",
-                message=f"处理完成：已生成原始版和 {organized.sentence_count} 句整理版",
+                message=(
+                    f"处理完成：YouTube 读音参考综合 + {organized.sentence_count} 句整理版"
+                    if reference_track is not None
+                    else (
+                        "处理完成：无可用 YouTube 字幕，已生成 "
+                        f"{organized.sentence_count} 句整理版"
+                    )
+                ),
                 result_name=raw_path.name,
                 result_path=str(raw_path),
                 results=results,
+                audio_path=str(audio_path) if audio_path else None,
+                sentences_path=str(sentences_path) if sentences_path else None,
             )
         except Exception as exc:
             message = str(exc).strip() or exc.__class__.__name__
             if raw_path is not None and raw_path.is_file():
+                if audio_path is not None and audio_path.is_file():
+                    try:
+                        fallback_dir = self.project_root / "workspace" / "player-fallback"
+                        fallback_dir.mkdir(parents=True, exist_ok=True)
+                        fallback_name = hashlib.sha256(str(raw_path).encode()).hexdigest()[:20]
+                        sentences_path = write_fallback_player_document(
+                            raw_path, fallback_dir / f"{fallback_name}.json"
+                        )
+                    except (OSError, UnicodeError, ValueError, SubmdError):
+                        sentences_path = None
                 self._finish_job(
                     job_id,
                     status="partial",
@@ -268,6 +559,8 @@ class ExtractionJobManager:
                     result_name=raw_path.name,
                     result_path=str(raw_path),
                     results=raw_results,
+                    audio_path=str(audio_path) if audio_path else None,
+                    sentences_path=str(sentences_path) if sentences_path else None,
                 )
                 return
             self._finish_job(
@@ -276,6 +569,26 @@ class ExtractionJobManager:
                 message="提取失败",
                 error=message,
             )
+
+    def _load_source_document(
+        self, source_url: str, prefer_corrected: bool = False
+    ) -> SubtitleDocument | None:
+        video_id = self._youtube_video_id(source_url)
+        if not video_id:
+            return None
+        job_dir = self.project_root / "workspace" / video_id
+        corrected_path = job_dir / "corrected_segments.json"
+        path = (
+            corrected_path
+            if prefer_corrected and corrected_path.is_file()
+            else job_dir / "segments.json"
+        )
+        if not path.is_file():
+            return None
+        try:
+            return SubtitleDocument.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def _result_entry(kind: str, label: str, path: Path) -> dict[str, str]:
@@ -299,11 +612,31 @@ class ExtractionJobManager:
                     return path
 
         for path in (self.project_root / "output").glob("*.md"):
-            if "（整理版" in path.stem:
+            if "（整理版" in path.stem or "综合校正版" in path.stem:
                 continue
             saved_url = self._source_url_from_markdown(path)
             if saved_url and self._same_youtube_video(source_url, saved_url):
                 return path.resolve()
+        return None
+
+    def _find_reusable_audio(self, source_url: str, raw_path: Path) -> Path | None:
+        sidecar = raw_path.with_suffix(".m4a")
+        if sidecar.is_file() and sidecar.parent == (self.project_root / "output").resolve():
+            return sidecar
+        with self._lock:
+            records = [dict(item) for item in self._history]
+        for record in records:
+            if not self._same_youtube_video(source_url, str(record.get("source_url") or "")):
+                continue
+            item = next(
+                (result for result in record.get("results", []) if result.get("kind") == "audio"),
+                None,
+            )
+            if item and item.get("path"):
+                candidate = Path(str(item["path"])).expanduser().resolve()
+                output_root = (self.project_root / "output").resolve()
+                if candidate.is_file() and candidate.parent == output_root:
+                    return candidate
         return None
 
     @staticmethod
@@ -388,6 +721,12 @@ class ExtractionJobManager:
                                 "organized", "整理版（只含字幕）", organized_path
                             )
                         )
+                    audio_path = raw_path.with_suffix(".m4a")
+                    if audio_path.is_file():
+                        results.append(
+                            self._result_entry("audio", "视频音频（M4A）", audio_path)
+                        )
+                        record["audio_path"] = str(audio_path)
                     record["results"] = results
                     changed = True
             if record.get("status") == "running":
@@ -409,7 +748,7 @@ class ExtractionJobManager:
         for path in sorted(
             output_root.glob("*.md"), key=lambda item: item.stat().st_mtime, reverse=True
         ):
-            if "（整理版" in path.stem:
+            if "（整理版" in path.stem or "综合校正版" in path.stem:
                 continue
             source_url = ""
             try:
@@ -431,6 +770,10 @@ class ExtractionJobManager:
                 results.append(
                     self._result_entry("organized", "整理版（只含字幕）", organized_path)
                 )
+            audio_path = path.with_suffix(".m4a")
+            if audio_path.is_file():
+                results.append(self._result_entry("audio", "视频音频（M4A）", audio_path))
+            sentences_path = self._find_organized_sentences(path.name)
             records.append(
                 {
                     "job_id": f"imported-{digest}",
@@ -443,9 +786,25 @@ class ExtractionJobManager:
                     "result_name": path.name,
                     "result_path": str(path.resolve()),
                     "results": results,
+                    "audio_path": str(audio_path.resolve()) if audio_path.is_file() else None,
+                    "sentences_path": (
+                        str(sentences_path.resolve()) if sentences_path is not None else None
+                    ),
                 }
             )
         return records[:100]
+
+    def _find_organized_sentences(self, source_name: str) -> Path | None:
+        for path in (self.project_root / "workspace" / "organize").glob(
+            "*/organized_segments.json"
+        ):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if payload.get("source_markdown") == source_name:
+                return path.resolve()
+        return None
 
     def _persist_history_locked(self) -> None:
         write_json(self.history_path, self._history[:100])
@@ -456,7 +815,7 @@ class ExtractionJobManager:
             "SUBMD_YOUTUBE_URL": "YouTube URL",
             "SUBMD_OCR_BASE_URL": "OCR API 地址",
             "SUBMD_OCR_MODEL": "视觉模型名称",
-            _SECRET_FIELD: "API Key",
+            _PRIMARY_SECRET_FIELD: "API Key",
         }
         missing = [label for key, label in required.items() if not values.get(key)]
         if missing:
@@ -470,10 +829,11 @@ class ExtractionJobManager:
         }:
             raise ValueError("YouTube URL 无效，请输入 youtube.com 或 youtu.be 视频地址")
 
-    @staticmethod
-    def _public_record(record: dict[str, Any]) -> dict[str, Any]:
+    def _public_record(self, record: dict[str, Any]) -> dict[str, Any]:
         public = {
-            key: value for key, value in record.items() if key not in {"result_path", "results"}
+            key: value
+            for key, value in record.items()
+            if key not in {"result_path", "results", "audio_path", "sentences_path"}
         }
         public_results: list[dict[str, str]] = []
         for item in record.get("results", []):
@@ -492,6 +852,10 @@ class ExtractionJobManager:
             public["results"] = public_results
         if record.get("result_path"):
             public["download_url"] = f"/api/files/{record['job_id']}"
+        audio_path = Path(str(record.get("audio_path") or "")).expanduser()
+        sentences_path = Path(str(record.get("sentences_path") or "")).expanduser()
+        if audio_path.is_file() and sentences_path.is_file():
+            public["player_url"] = f"/api/player/{record['job_id']}"
         return public
 
 
@@ -513,6 +877,15 @@ class UiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.manager.config())
             elif path == "/api/history":
                 self._send_json({"items": self.server.manager.history()})
+            elif path.startswith("/api/player/"):
+                parts = path.removeprefix("/api/player/").split("/", maxsplit=1)
+                job_id = parts[0]
+                if len(parts) == 2 and parts[1] == "audio":
+                    self._send_media(self.server.manager.player_audio_file(job_id))
+                elif len(parts) == 1:
+                    self._send_json(self.server.manager.player_data(job_id))
+                else:
+                    self._send_error(HTTPStatus.NOT_FOUND, "播放器资源不存在")
             elif path.startswith("/api/jobs/"):
                 job_id = path.removeprefix("/api/jobs/")
                 self._send_json(self.server.manager.job(job_id))
@@ -547,6 +920,35 @@ class UiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.manager.save_config(payload))
             elif path == "/api/jobs":
                 self._send_json(self.server.manager.start(payload), status=HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/player/") and path.endswith("/resegment"):
+                job_id = (
+                    path.removeprefix("/api/player/")
+                    .removesuffix("/resegment")
+                    .strip("/")
+                )
+                if not job_id:
+                    raise ValueError("播放器任务 ID 为空")
+                self._send_json(
+                    self.server.manager.resegment_sentences(
+                        job_id,
+                        payload.get("sentence_ids") or [],
+                        payload.get("edited_text") or "",
+                    )
+                )
+            elif path.startswith("/api/player/") and path.endswith("/analysis"):
+                job_id = path.removeprefix("/api/player/").removesuffix("/analysis").strip("/")
+                if not job_id:
+                    raise ValueError("播放器任务 ID 为空")
+                force = payload.get("force", False)
+                if not isinstance(force, bool):
+                    raise ValueError("force 必须是布尔值")
+                self._send_json(
+                    self.server.manager.analyze_sentence(
+                        job_id,
+                        str(payload.get("sentence_id") or ""),
+                        force=force,
+                    )
+                )
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, "接口不存在")
         except (SubmdError, ValueError) as exc:
@@ -587,7 +989,12 @@ class UiRequestHandler(BaseHTTPRequestHandler):
         payload = path.read_bytes()
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        if content_type.startswith("text/") or content_type in {
+            "application/javascript",
+            "application/json",
+        }:
+            content_type = f"{content_type}; charset=utf-8"
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         if download:
@@ -595,6 +1002,60 @@ class UiRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded}")
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_media(self, path: Path) -> None:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        file_size = path.stat().st_size
+        start = 0
+        end = file_size - 1
+        status = HTTPStatus.OK
+        range_header = self.headers.get("Range")
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+            left, right = match.groups()
+            if left:
+                start = int(left)
+                end = int(right) if right else end
+            elif right:
+                suffix_length = min(file_size, int(right))
+                start = file_size - suffix_length
+            if start >= file_size or end < start:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+            end = min(end, file_size - 1)
+            status = HTTPStatus.PARTIAL_CONTENT
+
+        length = end - start + 1
+        content_type = mimetypes.guess_type(path.name)[0] or "audio/mp4"
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.end_headers()
+        with path.open("rb") as source:
+            source.seek(start)
+            remaining = length
+            while remaining:
+                chunk = source.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Browsers routinely cancel an audio range request after seeking.
+                    return
+                remaining -= len(chunk)
 
     def log_message(self, format: str, *args: Any) -> None:
         del format, args

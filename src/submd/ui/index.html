@@ -79,6 +79,32 @@
             </div>
           </details>
 
+          <details class="advanced">
+            <summary>语言学习模型（可选，留空时复用整理模型）</summary>
+            <div class="field-grid advanced-grid">
+              <label class="field">
+                <span>语言学习 API Base URL</span>
+                <input name="SUBMD_LEARNING_BASE_URL" type="url"
+                  placeholder="留空时复用整理模型或 OCR 地址" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>语言学习模型名称</span>
+                <input name="SUBMD_LEARNING_MODEL" type="text"
+                  placeholder="留空时复用整理模型或视觉模型" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>语言学习 API Key</span>
+                <div class="password-wrap">
+                  <input id="learning-api-key" name="SUBMD_LEARNING_API_KEY" type="password"
+                    placeholder="留空时复用 OCR API Key" autocomplete="new-password" />
+                  <button type="button" id="toggle-learning-key" class="icon-button"
+                    aria-label="显示语言学习 API Key">显示</button>
+                </div>
+                <small id="learning-key-hint">未单独配置；将复用 OCR API Key</small>
+              </label>
+            </div>
+          </details>
+
           <div class="actions">
             <button type="button" id="save-button" class="button secondary">保存配置</button>
             <button type="submit" id="extract-button" class="button primary">
@@ -102,10 +128,43 @@
         </div>
       </section>
 
+      <section id="player-panel" class="panel player-panel hidden" aria-labelledby="player-title">
+        <div class="section-heading player-heading">
+          <div>
+            <p class="section-index">02</p>
+            <h2 id="player-title">字幕音频播放器</h2>
+            <p id="player-summary" class="muted"></p>
+          </div>
+          <button id="close-player" class="text-button" type="button">收起播放器</button>
+        </div>
+        <div class="audio-dock">
+          <audio id="subtitle-audio" controls preload="metadata"></audio>
+          <div class="sentence-controls">
+            <button id="previous-sentence" class="button secondary" type="button">上一句</button>
+            <span id="current-time" aria-live="polite">00:00</span>
+            <button id="next-sentence" class="button secondary" type="button">下一句</button>
+            <button id="loop-sentence" class="button loop-button" type="button"
+              aria-pressed="false">单句循环：关</button>
+            <button id="start-boundary-selection" class="button secondary" type="button">断句纠错</button>
+          </div>
+        </div>
+        <div class="boundary-help">
+          长按任意句子进入断句纠错；也可先播放一句，再点“断句纠错”。之后点击另一句可连续选择前后句。
+        </div>
+        <div id="boundary-toolbar" class="boundary-toolbar hidden" role="status">
+          <span id="boundary-selection-count">已选择 0 句</span>
+          <div>
+            <button id="cancel-boundary-selection" class="text-button" type="button">取消</button>
+            <button id="open-boundary-editor" class="button primary" type="button">修改断句</button>
+          </div>
+        </div>
+        <ol id="sentence-list" class="sentence-list" aria-label="可点击字幕"></ol>
+      </section>
+
       <section class="panel history-panel" aria-labelledby="history-title">
         <div class="section-heading history-heading">
           <div>
-            <p class="section-index">02</p>
+            <p class="section-index">03</p>
             <h2 id="history-title">提取历史</h2>
           </div>
           <button id="refresh-history" class="text-button" type="button">刷新</button>
@@ -122,6 +181,48 @@
         </div>
       </section>
     </main>
+
+    <dialog id="analysis-dialog" class="analysis-dialog" aria-labelledby="analysis-title">
+      <div class="analysis-header">
+        <div>
+          <p class="section-index">LANGUAGE NOTES</p>
+          <h2 id="analysis-title">句子分析</h2>
+        </div>
+        <div class="analysis-header-actions">
+          <span id="analysis-cache-status" class="analysis-cache-status"></span>
+          <button id="reanalyze-sentence" class="reanalyze-button hidden" type="button">重新分析</button>
+          <button id="close-analysis" class="dialog-close" type="button"
+            aria-label="关闭分析弹窗">×</button>
+        </div>
+      </div>
+      <p id="analysis-sentence" class="analysis-sentence"></p>
+      <div id="analysis-content" class="analysis-content" tabindex="0">
+        <p class="analysis-placeholder">正在等待分析内容…</p>
+      </div>
+    </dialog>
+
+    <dialog id="boundary-dialog" class="boundary-dialog" aria-labelledby="boundary-title">
+      <div class="analysis-header">
+        <div>
+          <p class="section-index">BOUNDARY CORRECTION</p>
+          <h2 id="boundary-title">手动修改断句</h2>
+        </div>
+        <button id="close-boundary-dialog" class="dialog-close" type="button"
+          aria-label="关闭断句弹窗">×</button>
+      </div>
+      <div class="boundary-editor-body">
+        <p class="boundary-instruction">只需增删或移动句号“。”；每个句号就是一个新断点。字幕文字不能改动。</p>
+        <textarea id="boundary-editor-text" rows="8" spellcheck="false"></textarea>
+        <div class="boundary-preview-block">
+          <h3>修改后的断句</h3>
+          <ol id="boundary-preview"></ol>
+        </div>
+      </div>
+      <div class="boundary-dialog-actions">
+        <button id="cancel-boundary-edit" class="button secondary" type="button">取消</button>
+        <button id="save-boundary-edit" class="button primary" type="button">保存并重新对齐音频</button>
+      </div>
+    </dialog>
 
     <dialog id="error-dialog" class="error-dialog">
       <div class="dialog-symbol">!</div>

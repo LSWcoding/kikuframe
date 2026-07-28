@@ -8,7 +8,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from submd.errors import DownloadError, OrganizeError
-from submd.models import ExtractionResult, OrganizeResult
+from submd.models import ExtractionResult, OrganizeResult, SentenceLearningAnalysis
 from submd.web import EnvironmentStore, ExtractionJobManager, create_ui_server
 
 
@@ -21,6 +21,9 @@ def config_payload() -> dict[str, str]:
         "SUBMD_YOUTUBE_COOKIES_FROM_BROWSER": "chrome",
         "SUBMD_TEXT_BASE_URL": "",
         "SUBMD_TEXT_MODEL": "text-model",
+        "SUBMD_LEARNING_BASE_URL": "",
+        "SUBMD_LEARNING_MODEL": "",
+        "SUBMD_LEARNING_API_KEY": "",
     }
 
 
@@ -41,6 +44,35 @@ class SuccessfulOrganizer:
         checkpoint = workspace_root / "organize" / "checkpoint.json"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_text("{}\n", encoding="utf-8")
+        sentences = workspace_root / "organize" / "organized_segments.json"
+        sentences.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_markdown": source_path.name,
+                    "sentences": [
+                        {
+                            "sentence_id": "s000001",
+                            "text": "第一句话。",
+                            "start_ms": 0,
+                            "end_ms": 1000,
+                            "source_unit_ids": ["u000001"],
+                            "source_segment_ids": ["seg000001"],
+                        },
+                        {
+                            "sentence_id": "s000002",
+                            "text": "第二句话。",
+                            "start_ms": 1000,
+                            "end_ms": 2000,
+                            "source_unit_ids": ["u000002"],
+                            "source_segment_ids": ["seg000002"],
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         return OrganizeResult(
             source_path=source_path,
             markdown_path=organized,
@@ -49,6 +81,36 @@ class SuccessfulOrganizer:
             sentence_count=2,
             api_call_count=1,
             reused_chunk_count=0,
+            sentences_path=sentences,
+        )
+
+
+class SuccessfulAnalyzer:
+    def __init__(self, api_key: str, captured: dict | None = None) -> None:
+        self.api_key = api_key
+        self.captured = captured if captured is not None else {}
+
+    def analyze(self, sentence, config, cache_root, force=False):
+        self.captured.update(
+            sentence=sentence,
+            base_url=config.base_url,
+            model=config.model,
+            api_key=self.api_key,
+            cache_root=str(cache_root),
+            force=force,
+        )
+        return (
+            SentenceLearningAnalysis(
+                prompt_version="test-v1",
+                sentence=sentence,
+                model=config.model,
+                translation="第二句话的翻译。",
+                vocabulary=[
+                    {"expression": "第二句", "reading": "だいにく", "meaning": "第二句"}
+                ],
+                grammar=[{"pattern": "です", "explanation": "礼貌判断句。"}],
+            ),
+            False,
         )
 
 
@@ -72,6 +134,8 @@ def test_environment_store_never_returns_api_key(tmp_path: Path) -> None:
 
 
 def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
+    learning_capture: dict = {}
+
     class SuccessfulPipeline:
         def __init__(self, status) -> None:
             self.status = status
@@ -81,6 +145,8 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
             result = config.output_dir / "测试视频.md"
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_text("测试字幕\n", encoding="utf-8")
+            audio = result.with_suffix(".m4a")
+            audio.write_bytes(b"0123456789")
             intermediate = config.workspace_root / "test.json"
             intermediate.parent.mkdir(parents=True, exist_ok=True)
             intermediate.write_text("{}\n", encoding="utf-8")
@@ -93,12 +159,14 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
                 markdown_path=result,
                 segment_count=1,
                 observation_count=1,
+                audio_path=audio,
             )
 
     manager = ExtractionJobManager(
         tmp_path,
         pipeline_factory=lambda status, _key: SuccessfulPipeline(status),
         organizer_factory=lambda _status, _key: SuccessfulOrganizer(),
+        analyzer_factory=lambda key: SuccessfulAnalyzer(key, learning_capture),
     )
     started = manager.start(config_payload())
     finished = wait_for_job(manager, started["job_id"])
@@ -106,7 +174,12 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
     assert finished["status"] == "succeeded"
     assert finished["result_name"] == "测试视频.md"
     assert finished["download_url"] == f"/api/files/{started['job_id']}"
-    assert [item["kind"] for item in finished["results"]] == ["raw", "organized"]
+    assert [item["kind"] for item in finished["results"]] == [
+        "raw",
+        "audio",
+        "organized",
+    ]
+    assert finished["player_url"] == f"/api/player/{started['job_id']}"
     assert manager.result_file(started["job_id"]).read_text(encoding="utf-8") == "测试字幕\n"
     assert manager.result_file(started["job_id"], "organized").read_text(
         encoding="utf-8"
@@ -116,6 +189,32 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
     assert history[0]["status"] == "succeeded"
     assert "result_path" not in history[0]
     assert all("path" not in item for item in history[0]["results"])
+    player = manager.player_data(started["job_id"])
+    assert player["sentence_count"] == 2
+    assert player["sentences"][1]["start_ms"] == 1000
+    assert player["analysis_url"] == f"/api/player/{started['job_id']}/analysis"
+    assert player["resegment_url"] == f"/api/player/{started['job_id']}/resegment"
+    analysis = manager.analyze_sentence(started["job_id"], "s000002")
+    assert analysis["translation"] == "第二句话的翻译。"
+    assert analysis["cached"] is False
+    assert learning_capture == {
+        "sentence": "第二句话。",
+        "base_url": "https://vendor.example/v1",
+        "model": "text-model",
+        "api_key": "secret-key",
+        "cache_root": str(tmp_path / "workspace" / "learning"),
+        "force": False,
+    }
+    resegmented = manager.resegment_sentences(
+        started["job_id"],
+        ["s000001", "s000002"],
+        "第一句话第二句话。",
+    )
+    assert resegmented["saved"] is True
+    assert resegmented["sentence_count"] == 1
+    assert resegmented["sentences"][0]["start_ms"] == 0
+    assert resegmented["sentences"][0]["end_ms"] == 2000
+    assert (tmp_path / "workspace" / "manual-edits").is_dir()
 
 
 def test_job_manager_records_failure_reason(tmp_path: Path) -> None:
@@ -242,15 +341,31 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
         assert 'id="extract-button"' in html
         assert 'id="history-body"' in html
         assert 'id="error-dialog"' in html
+        assert 'id="player-panel"' in html
+        assert 'id="loop-sentence"' in html
+        assert 'id="analysis-dialog"' in html
+        assert 'id="reanalyze-sentence"' in html
+        assert 'id="boundary-toolbar"' in html
+        assert 'id="boundary-dialog"' in html
+        assert 'id="boundary-editor-text"' in html
 
         with urlopen(f"{base}/assets/app.js", timeout=2) as response:
             script = response.read().decode()
         assert '"failed", ["partial", "failed", "interrupted"]' in script
+        assert "data-sentence-index" in script
+        assert "data-analysis-index" in script
+        assert "sentenceLoopEnabled" in script
+        assert "force" in script
+        assert "boundarySelectionAnchor" in script
+        assert "activeResegmentUrl" in script
+        assert "saveBoundaryEdit" in script
 
         with urlopen(f"{base}/api/config", timeout=2) as response:
             config = json.loads(response.read())
         assert config["SUBMD_OCR_API_KEY_CONFIGURED"] is True
+        assert config["SUBMD_LEARNING_API_KEY_CONFIGURED"] is False
         assert "SUBMD_OCR_API_KEY" not in config
+        assert "SUBMD_LEARNING_API_KEY" not in config
         assert "secret-key" not in json.dumps(config)
 
         request = Request(
@@ -267,6 +382,71 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
             assert "请填写" in payload["error"]
         else:
             raise AssertionError("invalid extraction request should fail")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_http_player_supports_clickable_sentences_and_ranges(tmp_path: Path) -> None:
+    class SuccessfulPipeline:
+        def run(self, config) -> ExtractionResult:
+            raw = config.output_dir / "播放器测试.md"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_text("- [00:00.000–00:01.000] 第一句话。\n", encoding="utf-8")
+            audio = raw.with_suffix(".m4a")
+            audio.write_bytes(b"0123456789")
+            intermediate = config.workspace_root / "test.json"
+            intermediate.parent.mkdir(parents=True, exist_ok=True)
+            intermediate.write_text("{}\n", encoding="utf-8")
+            return ExtractionResult(
+                metadata_path=intermediate,
+                config_path=intermediate,
+                observations_path=intermediate,
+                api_calls_path=intermediate,
+                segments_path=intermediate,
+                markdown_path=raw,
+                segment_count=1,
+                observation_count=1,
+                audio_path=audio,
+            )
+
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda _status, _key: SuccessfulPipeline(),
+        organizer_factory=lambda _status, _key: SuccessfulOrganizer(),
+        analyzer_factory=lambda key: SuccessfulAnalyzer(key),
+    )
+    job = wait_for_job(manager, manager.start(config_payload())["job_id"])
+    server = create_ui_server(manager, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urlopen(f"{base}{job['player_url']}", timeout=2) as response:
+            player = json.loads(response.read())
+        assert player["sentences"][0]["text"] == "第一句话。"
+        assert player["audio_url"].endswith("/audio")
+        assert player["analysis_url"].endswith("/analysis")
+
+        analysis_request = Request(
+            f"{base}{player['analysis_url']}",
+            data=json.dumps({"sentence_id": "s000001", "force": True}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(analysis_request, timeout=2) as response:
+            analysis = json.loads(response.read())
+        assert analysis["translation"] == "第二句话的翻译。"
+        assert analysis["vocabulary"][0]["reading"] == "だいにく"
+
+        request = Request(
+            f"{base}{player['audio_url']}",
+            headers={"Range": "bytes=2-5"},
+        )
+        with urlopen(request, timeout=2) as response:
+            assert response.status == 206
+            assert response.headers["Content-Range"] == "bytes 2-5/10"
+            assert response.read() == b"2345"
     finally:
         server.shutdown()
         server.server_close()

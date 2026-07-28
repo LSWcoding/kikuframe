@@ -75,6 +75,13 @@ def test_pipeline_writes_json_and_markdown(tmp_path: Path) -> None:
             "lavfi",
             "-i",
             "color=c=black:s=320x180:r=2:d=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2",
+            "-shortest",
+            "-c:a",
+            "aac",
             "-pix_fmt",
             "yuv420p",
             str(video),
@@ -103,6 +110,8 @@ def test_pipeline_writes_json_and_markdown(tmp_path: Path) -> None:
     assert result.segment_count == 2
     assert result.observation_count == 4
     assert result.markdown_path.is_file()
+    assert result.audio_path is not None
+    assert result.audio_path.is_file()
     assert "HELLO" in result.markdown_path.read_text(encoding="utf-8")
     assert "WORLD" in result.markdown_path.read_text(encoding="utf-8")
 

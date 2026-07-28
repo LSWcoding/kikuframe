@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -67,6 +68,22 @@ class TextLlmConfig(BaseModel):
         self.base_url = self.base_url.rstrip("/")
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("Text LLM API base URL must start with http:// or https://")
+        return self
+
+
+class LanguageLearningConfig(BaseModel):
+    provider: Literal["openai_compatible"] = "openai_compatible"
+    base_url: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    timeout_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
+    max_retries: int = Field(default=3, ge=0, le=10)
+    json_mode: bool = True
+
+    @model_validator(mode="after")
+    def normalize_url(self) -> LanguageLearningConfig:
+        self.base_url = self.base_url.rstrip("/")
+        if not self.base_url.startswith(("http://", "https://")):
+            raise ValueError("Learning API base URL must start with http:// or https://")
         return self
 
 
@@ -143,11 +160,14 @@ class SubtitleSegment(BaseModel):
     start_ms: int
     end_ms: int
     text: str
-    source: Literal["burned_ocr"] = "burned_ocr"
+    source: Literal["burned_ocr", "burned_ocr_corrected"] = "burned_ocr"
     confidence: float = Field(ge=0.0, le=1.0)
     observation_count: int = 1
     alternatives: list[str] = Field(default_factory=list)
     needs_review: bool = False
+    original_text: str | None = None
+    youtube_reference: list[str] = Field(default_factory=list)
+    correction_reason: str | None = None
 
 
 class SubtitleDocument(BaseModel):
@@ -165,6 +185,83 @@ class ExtractionResult(BaseModel):
     markdown_path: Path
     segment_count: int
     observation_count: int
+    audio_path: Path | None = None
+
+
+class YouTubeCaptionCue(BaseModel):
+    cue_id: str
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> YouTubeCaptionCue:
+        if self.end_ms < self.start_ms:
+            raise ValueError("YouTube caption end_ms must be at least start_ms")
+        return self
+
+
+class YouTubeCaptionTrack(BaseModel):
+    schema_version: int = 1
+    video_id: str
+    language: str
+    source: Literal["manual", "automatic"]
+    name: str | None = None
+    cues: list[YouTubeCaptionCue]
+
+
+class CaptionCorrection(BaseModel):
+    segment_id: str
+    corrected_text: str = Field(min_length=1)
+    reason: str = ""
+
+
+class OrganizedSentence(BaseModel):
+    sentence_id: str
+    text: str
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    source_unit_ids: list[str] = Field(default_factory=list)
+    source_segment_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> OrganizedSentence:
+        if self.end_ms < self.start_ms:
+            raise ValueError("organized sentence end_ms must be at least start_ms")
+        return self
+
+
+class OrganizedSubtitleDocument(BaseModel):
+    schema_version: int = 1
+    source_markdown: str
+    sentences: list[OrganizedSentence]
+
+
+class VocabularyAnalysisItem(BaseModel):
+    expression: str = Field(min_length=1)
+    reading: str = ""
+    meaning: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_reading_for_kanji(self) -> VocabularyAnalysisItem:
+        if re.search(r"[\u3400-\u9fff]", self.expression) and not self.reading.strip():
+            raise ValueError("Japanese vocabulary containing kanji must include a hiragana reading")
+        return self
+
+
+class GrammarAnalysisItem(BaseModel):
+    pattern: str = Field(min_length=1)
+    explanation: str = Field(min_length=1)
+
+
+class SentenceLearningAnalysis(BaseModel):
+    schema_version: int = 1
+    prompt_version: str
+    sentence: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    translation: str = Field(min_length=1)
+    vocabulary: list[VocabularyAnalysisItem]
+    grammar: list[GrammarAnalysisItem]
 
 
 class OrganizeResult(BaseModel):
@@ -175,3 +272,4 @@ class OrganizeResult(BaseModel):
     sentence_count: int
     api_call_count: int
     reused_chunk_count: int
+    sentences_path: Path | None = None
