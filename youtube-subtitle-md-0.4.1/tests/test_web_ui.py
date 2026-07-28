@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+from submd.errors import DownloadError, OrganizeError
+from submd.models import ExtractionResult, OrganizeResult
+from submd.web import EnvironmentStore, ExtractionJobManager, create_ui_server
+
+
+def config_payload() -> dict[str, str]:
+    return {
+        "SUBMD_YOUTUBE_URL": "https://youtu.be/ui-test",
+        "SUBMD_OCR_BASE_URL": "https://vendor.example/v1",
+        "SUBMD_OCR_MODEL": "vision-model",
+        "SUBMD_OCR_API_KEY": "secret-key",
+        "SUBMD_YOUTUBE_COOKIES_FROM_BROWSER": "chrome",
+        "SUBMD_TEXT_BASE_URL": "",
+        "SUBMD_TEXT_MODEL": "text-model",
+    }
+
+
+def wait_for_job(manager: ExtractionJobManager, job_id: str) -> dict:
+    for _ in range(100):
+        job = manager.job(job_id)
+        if job["status"] != "running":
+            return job
+        time.sleep(0.01)
+    raise AssertionError("background job did not finish")
+
+
+class SuccessfulOrganizer:
+    def run(self, source_path, config, workspace_root, output_dir, overwrite):
+        del config, overwrite
+        organized = output_dir / f"{source_path.stem}（整理版）.md"
+        organized.write_text("第一句话。\n第二句话。\n", encoding="utf-8")
+        checkpoint = workspace_root / "organize" / "checkpoint.json"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text("{}\n", encoding="utf-8")
+        return OrganizeResult(
+            source_path=source_path,
+            markdown_path=organized,
+            checkpoint_path=checkpoint,
+            source_fragment_count=2,
+            sentence_count=2,
+            api_call_count=1,
+            reused_chunk_count=0,
+        )
+
+
+def test_environment_store_never_returns_api_key(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        'SUBMD_OCR_BASE_URL="https://vendor.example/v1"\nSUBMD_OCR_API_KEY="stored-secret"\n',
+        encoding="utf-8",
+    )
+    store = EnvironmentStore(env_path)
+
+    public = store.read_public()
+    assert public["SUBMD_OCR_API_KEY_CONFIGURED"] is True
+    assert "SUBMD_OCR_API_KEY" not in public
+    assert "stored-secret" not in json.dumps(public)
+
+    store.update({"SUBMD_OCR_BASE_URL": "https://new.example/v1", "SUBMD_OCR_API_KEY": ""})
+    private = store.read_private()
+    assert private["SUBMD_OCR_BASE_URL"] == "https://new.example/v1"
+    assert private["SUBMD_OCR_API_KEY"] == "stored-secret"
+
+
+def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
+    class SuccessfulPipeline:
+        def __init__(self, status) -> None:
+            self.status = status
+
+        def run(self, config) -> ExtractionResult:
+            self.status("正在识别测试字幕…")
+            result = config.output_dir / "测试视频.md"
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("测试字幕\n", encoding="utf-8")
+            intermediate = config.workspace_root / "test.json"
+            intermediate.parent.mkdir(parents=True, exist_ok=True)
+            intermediate.write_text("{}\n", encoding="utf-8")
+            return ExtractionResult(
+                metadata_path=intermediate,
+                config_path=intermediate,
+                observations_path=intermediate,
+                api_calls_path=intermediate,
+                segments_path=intermediate,
+                markdown_path=result,
+                segment_count=1,
+                observation_count=1,
+            )
+
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda status, _key: SuccessfulPipeline(status),
+        organizer_factory=lambda _status, _key: SuccessfulOrganizer(),
+    )
+    started = manager.start(config_payload())
+    finished = wait_for_job(manager, started["job_id"])
+
+    assert finished["status"] == "succeeded"
+    assert finished["result_name"] == "测试视频.md"
+    assert finished["download_url"] == f"/api/files/{started['job_id']}"
+    assert [item["kind"] for item in finished["results"]] == ["raw", "organized"]
+    assert manager.result_file(started["job_id"]).read_text(encoding="utf-8") == "测试字幕\n"
+    assert manager.result_file(started["job_id"], "organized").read_text(
+        encoding="utf-8"
+    ) == "第一句话。\n第二句话。\n"
+    history = manager.history()
+    assert len(history) == 1
+    assert history[0]["status"] == "succeeded"
+    assert "result_path" not in history[0]
+    assert all("path" not in item for item in history[0]["results"])
+
+
+def test_job_manager_records_failure_reason(tmp_path: Path) -> None:
+    class FailedPipeline:
+        def run(self, _config):
+            raise DownloadError("YouTube 拒绝访问测试视频")
+
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda _status, _key: FailedPipeline(),
+    )
+    started = manager.start(config_payload())
+    finished = wait_for_job(manager, started["job_id"])
+
+    assert finished["status"] == "failed"
+    assert finished["error"] == "YouTube 拒绝访问测试视频"
+    assert manager.history()[0]["error"] == "YouTube 拒绝访问测试视频"
+
+
+def test_retry_reuses_raw_markdown_after_organizer_failure(tmp_path: Path) -> None:
+    pipeline_calls = 0
+    organizer_calls = 0
+
+    class CountingPipeline:
+        def run(self, config) -> ExtractionResult:
+            nonlocal pipeline_calls
+            pipeline_calls += 1
+            result = config.output_dir / "复用测试.md"
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text(
+                f'---\nsource_url: "{config.source_url}"\n---\n\n'
+                "- [00:00.000–00:01.000] 测试字幕\n",
+                encoding="utf-8",
+            )
+            intermediate = config.workspace_root / "test.json"
+            intermediate.parent.mkdir(parents=True, exist_ok=True)
+            intermediate.write_text("{}\n", encoding="utf-8")
+            return ExtractionResult(
+                metadata_path=intermediate,
+                config_path=intermediate,
+                observations_path=intermediate,
+                api_calls_path=intermediate,
+                segments_path=intermediate,
+                markdown_path=result,
+                segment_count=1,
+                observation_count=1,
+            )
+
+    class RetryOrganizer(SuccessfulOrganizer):
+        def run(self, *args, **kwargs):
+            nonlocal organizer_calls
+            organizer_calls += 1
+            if organizer_calls == 1:
+                raise OrganizeError("视觉模型不接受纯文本请求")
+            return super().run(*args, **kwargs)
+
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda _status, _key: CountingPipeline(),
+        organizer_factory=lambda _status, _key: RetryOrganizer(),
+    )
+    first = wait_for_job(manager, manager.start(config_payload())["job_id"])
+    assert first["status"] == "partial"
+    assert [item["kind"] for item in first["results"]] == ["raw"]
+    assert "不会重复视觉 OCR" in first["error"]
+
+    retry_payload = config_payload() | {
+        "SUBMD_YOUTUBE_URL": "https://www.youtube.com/watch?v=ui-test&si=different",
+        "SUBMD_TEXT_MODEL": "working-text-model",
+    }
+    second = wait_for_job(manager, manager.start(retry_payload)["job_id"])
+    assert second["status"] == "succeeded"
+    assert [item["kind"] for item in second["results"]] == ["raw", "organized"]
+    assert pipeline_calls == 1
+    assert organizer_calls == 2
+
+
+def test_invalid_youtube_url_is_rejected_without_overwriting_env(tmp_path: Path) -> None:
+    manager = ExtractionJobManager(tmp_path)
+    manager.save_config(config_payload())
+    invalid = config_payload() | {"SUBMD_YOUTUBE_URL": "https://example.com/video"}
+
+    try:
+        manager.start(invalid)
+    except ValueError as exc:
+        assert "YouTube URL 无效" in str(exc)
+    else:
+        raise AssertionError("non-YouTube URL should be rejected")
+
+    assert manager.config()["SUBMD_YOUTUBE_URL"] == "https://youtu.be/ui-test"
+
+
+def test_existing_subtitle_markdown_is_imported_into_history(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    subtitle = output / "现有字幕.md"
+    subtitle.write_text(
+        '---\nsource_url: "https://youtu.be/existing"\n---\n\n- [00:00.000–00:01.000] 字幕\n',
+        encoding="utf-8",
+    )
+    (output / "现有字幕（整理版）.md").write_text("字幕\n", encoding="utf-8")
+
+    manager = ExtractionJobManager(tmp_path)
+    history = manager.history()
+
+    assert len(history) == 1
+    assert history[0]["source_url"] == "https://youtu.be/existing"
+    assert history[0]["result_name"] == "现有字幕.md"
+    assert history[0]["download_url"].startswith("/api/files/imported-")
+    assert [item["kind"] for item in history[0]["results"]] == ["raw", "organized"]
+
+
+def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
+    manager = ExtractionJobManager(tmp_path)
+    manager.save_config(config_payload())
+    server = create_ui_server(manager, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urlopen(f"{base}/", timeout=2) as response:
+            html = response.read().decode()
+        assert "YouTube 烧录字幕提取" in html
+        assert 'id="extract-button"' in html
+        assert 'id="history-body"' in html
+        assert 'id="error-dialog"' in html
+
+        with urlopen(f"{base}/assets/app.js", timeout=2) as response:
+            script = response.read().decode()
+        assert '"failed", ["partial", "failed", "interrupted"]' in script
+
+        with urlopen(f"{base}/api/config", timeout=2) as response:
+            config = json.loads(response.read())
+        assert config["SUBMD_OCR_API_KEY_CONFIGURED"] is True
+        assert "SUBMD_OCR_API_KEY" not in config
+        assert "secret-key" not in json.dumps(config)
+
+        request = Request(
+            f"{base}/api/jobs",
+            data=json.dumps({key: "" for key in config_payload()}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urlopen(request, timeout=2)
+        except HTTPError as exc:
+            payload = json.loads(exc.read())
+            assert exc.code == 400
+            assert "请填写" in payload["error"]
+        else:
+            raise AssertionError("invalid extraction request should fail")
+    finally:
+        server.shutdown()
+        server.server_close()

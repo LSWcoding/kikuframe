@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>SubMD · YouTube 烧录字幕提取</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="brand-mark" aria-hidden="true">S</div>
+        <div>
+          <p class="eyebrow">SUBMD · LOCAL TOOL</p>
+          <h1>YouTube 烧录字幕提取</h1>
+          <p class="subtitle">配置保存在本机，视频帧直接发送到你指定的 OCR 服务。</p>
+        </div>
+        <span class="local-badge"><span></span>仅本机访问</span>
+      </header>
+
+      <section class="panel form-panel" aria-labelledby="config-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-index">01</p>
+            <h2 id="config-title">提取配置</h2>
+          </div>
+          <p>这些值会写入项目根目录的 <code>.env</code></p>
+        </div>
+
+        <form id="extract-form">
+          <label class="field field-wide">
+            <span>YouTube 视频 URL <b>必填</b></span>
+            <input id="youtube-url" name="SUBMD_YOUTUBE_URL" type="url" required
+              placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" />
+          </label>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>OCR API Base URL <b>必填</b></span>
+              <input name="SUBMD_OCR_BASE_URL" type="url" required
+                placeholder="https://vendor.example/v1" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>视觉模型名称 <b>必填</b></span>
+              <input name="SUBMD_OCR_MODEL" type="text" required
+                placeholder="provider/vision-model" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>API Key <b>必填</b></span>
+              <div class="password-wrap">
+                <input id="api-key" name="SUBMD_OCR_API_KEY" type="password"
+                  placeholder="输入后保存在本机" autocomplete="new-password" />
+                <button type="button" id="toggle-key" class="icon-button" aria-label="显示 API Key">显示</button>
+              </div>
+              <small id="key-hint">尚未配置</small>
+            </label>
+            <label class="field">
+              <span>浏览器 Cookie</span>
+              <input name="SUBMD_YOUTUBE_COOKIES_FROM_BROWSER" type="text"
+                placeholder="chrome" autocomplete="off" />
+              <small>YouTube 要求验证时使用，通常填写 chrome</small>
+            </label>
+          </div>
+
+          <details class="advanced">
+            <summary>整理版字幕模型（可选）</summary>
+            <div class="field-grid advanced-grid">
+              <label class="field">
+                <span>文本模型 API Base URL</span>
+                <input name="SUBMD_TEXT_BASE_URL" type="url"
+                  placeholder="留空时复用 OCR 地址" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>文本模型名称</span>
+                <input name="SUBMD_TEXT_MODEL" type="text"
+                  placeholder="留空时复用视觉模型" autocomplete="off" />
+              </label>
+            </div>
+          </details>
+
+          <div class="actions">
+            <button type="button" id="save-button" class="button secondary">保存配置</button>
+            <button type="submit" id="extract-button" class="button primary">
+              <span class="button-label">提取字幕</span>
+              <span class="button-loader" aria-hidden="true"></span>
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section id="job-panel" class="panel job-panel hidden" aria-live="polite">
+        <div class="job-icon" aria-hidden="true"></div>
+        <div class="job-copy">
+          <p class="job-label">当前任务</p>
+          <h2 id="job-status">准备开始…</h2>
+          <p id="job-url" class="muted truncate"></p>
+        </div>
+        <div id="job-result" class="result-link hidden">
+          <span>结果文件</span>
+          <div id="result-links"></div>
+        </div>
+      </section>
+
+      <section class="panel history-panel" aria-labelledby="history-title">
+        <div class="section-heading history-heading">
+          <div>
+            <p class="section-index">02</p>
+            <h2 id="history-title">提取历史</h2>
+          </div>
+          <button id="refresh-history" class="text-button" type="button">刷新</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>时间</th><th>视频</th><th>状态</th><th>结果</th></tr>
+            </thead>
+            <tbody id="history-body">
+              <tr><td colspan="4" class="empty-state">还没有提取记录</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="error-dialog" class="error-dialog">
+      <div class="dialog-symbol">!</div>
+      <h2 id="error-title">字幕处理失败</h2>
+      <p id="error-message">发生未知错误。</p>
+      <button id="close-error" class="button primary" type="button">知道了</button>
+    </dialog>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "youtube-subtitle-md"
+version = "0.4.1"
+description = "Extract and semantically organize burned-in YouTube subtitles as Markdown."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.28,<1",
+  "pillow>=11,<13",
+  "pydantic>=2.10,<3",
+  "python-dotenv>=1.1,<2",
+  "rapidfuzz>=3.10,<4",
+  "typer>=0.15,<1",
+  "yt-dlp[default]>=2025.11.12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+submd = "submd.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/submd"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
