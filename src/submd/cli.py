@@ -29,7 +29,7 @@ load_environment()
 
 app = typer.Typer(
     name="submd",
-    help="提取 YouTube 烧录字幕，并把字幕整理为纯文本 Markdown。",
+    help="KikuFrame：把日语视频转换为逐句对齐、可循环和可分析的学习材料。",
     no_args_is_help=True,
 )
 

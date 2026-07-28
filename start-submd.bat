@@ -4,21 +4,21 @@ cd /d "%~dp0"
 
 py -3.12 --version >nul 2>&1
 if errorlevel 1 (
-  echo [SubMD] Python 3.12 was not found. Install Python 3.12 and try again.
+  echo [KikuFrame] Python 3.12 was not found. Install Python 3.12 and try again.
   pause
   exit /b 1
 )
 
 where ffmpeg >nul 2>&1
 if errorlevel 1 (
-  echo [SubMD] FFmpeg was not found in PATH. Install FFmpeg and try again.
+  echo [KikuFrame] FFmpeg was not found in PATH. Install FFmpeg and try again.
   pause
   exit /b 1
 )
 
 where deno >nul 2>&1
 if errorlevel 1 (
-  echo [SubMD] Deno was not found in PATH. Install Deno and try again.
+  echo [KikuFrame] Deno was not found in PATH. Install Deno and try again.
   pause
   exit /b 1
 )

@@ -337,7 +337,8 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
     try:
         with urlopen(f"{base}/", timeout=2) as response:
             html = response.read().decode()
-        assert "YouTube 烧录字幕提取" in html
+        assert "KikuFrame" in html
+        assert "AI 日语视频学习工具" in html
         assert 'id="extract-button"' in html
         assert 'id="history-body"' in html
         assert 'id="error-dialog"' in html

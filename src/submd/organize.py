@@ -363,7 +363,7 @@ class OpenAICompatibleBoundaryEngine:
         headers = {
             "Authorization": f"Bearer {self.__api_key}",
             "Content-Type": "application/json",
-            "User-Agent": f"youtube-subtitle-md/{__version__}",
+            "User-Agent": f"kikuframe/{__version__}",
         }
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries + 1):

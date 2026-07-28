@@ -35,7 +35,7 @@ if [[ ! -x ".venv/bin/python" ]]; then
 fi
 
 if ! .venv/bin/python -c "import submd" >/dev/null 2>&1; then
-  print "首次启动，正在安装 SubMD…"
+  print "首次启动，正在安装 KikuFrame…"
   .venv/bin/python -m pip install -U pip
   .venv/bin/python -m pip install -e .
 else

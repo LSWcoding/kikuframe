@@ -1103,7 +1103,7 @@ def serve_ui(
     url = f"http://{host}:{server.server_port}"
     if open_browser:
         threading.Timer(0.5, open_ui_in_browser, args=(url,)).start()
-    print(f"SubMD UI 已启动：{url}")
+    print(f"KikuFrame UI 已启动：{url}")
     print("关闭这个窗口会停止 UI；字幕提取期间请保持窗口开启。")
     try:
         server.serve_forever()

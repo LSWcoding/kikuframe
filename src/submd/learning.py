@@ -115,7 +115,7 @@ class SentenceAnalyzer:
         headers = {
             "Authorization": f"Bearer {self.__api_key}",
             "Content-Type": "application/json",
-            "User-Agent": f"youtube-subtitle-md/{__version__}",
+            "User-Agent": f"kikuframe/{__version__}",
         }
         client = self._client or httpx.Client(timeout=config.timeout_seconds)
         last_error: Exception | None = None

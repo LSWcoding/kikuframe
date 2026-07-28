@@ -13,12 +13,12 @@ show_error() {
 if [[ ! -f "$PROJECT_DIR/pyproject.toml" \
   || ! -f "$PROJECT_DIR/start-submd.command" \
   || ! -d "$PROJECT_DIR/src/submd" ]]; then
-  show_error "安全检查失败：当前文件夹不像完整的 SubMD 项目，未执行删除。"
+  show_error "安全检查失败：当前文件夹不像完整的 KikuFrame 项目，未执行删除。"
 fi
 
 confirmation=$(
   /usr/bin/osascript -e '
-    button returned of (display dialog "确定把整个 SubMD 项目移到废纸篓吗？\n\n这会移除程序、.env 和 API Key、字幕结果、视频缓存、检查点以及 Python 虚拟环境。\n\nPython、FFmpeg 和 Deno 不会被删除。" buttons {"取消", "移到废纸篓"} default button "取消" cancel button "取消" with icon caution)
+    button returned of (display dialog "确定把整个 KikuFrame 项目移到废纸篓吗？\n\n这会移除程序、.env 和 API Key、字幕结果、视频缓存、检查点以及 Python 虚拟环境。\n\nPython、FFmpeg 和 Deno 不会被删除。" buttons {"取消", "移到废纸篓"} default button "取消" cancel button "取消" with icon caution)
   ' 2>/dev/null
 ) || exit 0
 
@@ -44,4 +44,4 @@ if ! /usr/bin/osascript -e "tell application \"Finder\" to delete POSIX file \"$
   show_error "无法将项目移到废纸篓，请关闭正在使用项目文件的程序后重试。"
 fi
 
-/usr/bin/osascript -e 'display notification "SubMD 已移到废纸篓" with title "SubMD"' >/dev/null 2>&1 || true
+/usr/bin/osascript -e 'display notification "KikuFrame 已移到废纸篓" with title "KikuFrame"' >/dev/null 2>&1 || true
