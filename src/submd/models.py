@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 
 class Roi(BaseModel):
@@ -238,19 +238,29 @@ class OrganizedSubtitleDocument(BaseModel):
 
 
 class VocabularyAnalysisItem(BaseModel):
+    kind: Literal["word", "collocation"]
     expression: str = Field(min_length=1)
+    lemma: str = Field(min_length=1)
     reading: str = ""
     meaning: str = Field(min_length=1)
 
     @model_validator(mode="after")
-    def require_reading_for_kanji(self) -> VocabularyAnalysisItem:
-        if re.search(r"[\u3400-\u9fff]", self.expression) and not self.reading.strip():
+    def require_reading_for_kanji(self, info: ValidationInfo) -> VocabularyAnalysisItem:
+        allow_missing = bool(
+            isinstance(info.context, dict) and info.context.get("allow_missing_reading")
+        )
+        if (
+            re.search(r"[\u3400-\u9fff]", f"{self.expression}{self.lemma}")
+            and not self.reading.strip()
+            and not allow_missing
+        ):
             raise ValueError("Japanese vocabulary containing kanji must include a hiragana reading")
         return self
 
 
 class GrammarAnalysisItem(BaseModel):
     pattern: str = Field(min_length=1)
+    lemma: str = Field(min_length=1)
     explanation: str = Field(min_length=1)
 
 

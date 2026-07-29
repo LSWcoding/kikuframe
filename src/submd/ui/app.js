@@ -38,11 +38,17 @@ const boundaryDialog = document.querySelector("#boundary-dialog");
 const boundaryEditorText = document.querySelector("#boundary-editor-text");
 const boundaryPreview = document.querySelector("#boundary-preview");
 const saveBoundaryEditButton = document.querySelector("#save-boundary-edit");
+const libraryDialog = document.querySelector("#library-dialog");
+const libraryContent = document.querySelector("#library-content");
+const librarySummary = document.querySelector("#library-summary");
+const exportLibrary = document.querySelector("#export-library");
 
 let pollingTimer = null;
 let playerSentences = [];
 let activeSentenceIndex = -1;
 let activeAnalysisUrl = "";
+let activeLibraryUrl = "";
+let activeAnalysisData = null;
 let sentenceLoopEnabled = false;
 let analysisSentenceIndex = -1;
 let activeResegmentUrl = "";
@@ -144,6 +150,83 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function learningKindLabel(kind) {
+  return ({ word: "单词", collocation: "搭配", grammar: "文法" })[kind] || "词条";
+}
+
+function renderStudyLibrary(data) {
+  const items = Array.isArray(data.items) ? data.items : [];
+  const totalEncounters = Number(data.encounter_count) || 0;
+  librarySummary.textContent = `${items.length} 个词条 · 累计遇见 ${totalEncounters} 次`;
+  exportLibrary.href = data.export_url || "/api/library/export";
+  exportLibrary.classList.toggle("disabled", items.length === 0);
+  exportLibrary.setAttribute("aria-disabled", items.length ? "false" : "true");
+  if (!items.length) {
+    libraryContent.innerHTML = '<p class="library-empty">还没有收藏单词、搭配或文法。</p>';
+    return;
+  }
+  libraryContent.innerHTML = `<div class="library-list">${items.map((item) => {
+    const reading = item.reading ? `（${escapeHtml(item.reading)}）` : "";
+    const meanings = Array.isArray(item.meanings) && item.meanings.length
+      ? item.meanings.map(escapeHtml).join("；")
+      : "—";
+    const count = Number(item.encounter_count) || 0;
+    const display = item.display || item.lemma;
+    return `<article class="library-entry" data-library-entry="${Number(item.entry_id)}">
+      <div class="library-entry-main">
+        <span class="library-kind">${learningKindLabel(item.kind)}</span>
+        <p class="library-expression"><strong>${escapeHtml(display)}${reading}</strong><span>：${meanings}</span></p>
+        <button class="library-count" type="button" data-library-count="${Number(item.entry_id)}"
+          aria-expanded="false" aria-label="查看 ${count} 次遇见记录">${count}</button>
+      </div>
+      <div class="library-occurrences hidden" data-library-occurrences="${Number(item.entry_id)}"></div>
+    </article>`;
+  }).join("")}</div>`;
+}
+
+async function openStudyLibrary() {
+  librarySummary.textContent = "正在读取本地学习记录…";
+  libraryContent.innerHTML = '<div class="library-loading"><span></span><p>正在加载单词库…</p></div>';
+  if (!libraryDialog.open) libraryDialog.showModal();
+  try {
+    renderStudyLibrary(await api("/api/library"));
+  } catch (error) {
+    libraryContent.innerHTML = `<p class="analysis-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function toggleLibraryOccurrences(button) {
+  const entryId = Number(button.dataset.libraryCount);
+  const panel = libraryContent.querySelector(`[data-library-occurrences="${entryId}"]`);
+  if (!panel || !entryId) return;
+  const isOpen = button.getAttribute("aria-expanded") === "true";
+  if (isOpen) {
+    button.setAttribute("aria-expanded", "false");
+    panel.classList.add("hidden");
+    return;
+  }
+  button.setAttribute("aria-expanded", "true");
+  panel.classList.remove("hidden");
+  if (panel.dataset.loaded === "true") return;
+  panel.innerHTML = '<p class="library-detail-loading">正在读取遇见记录…</p>';
+  try {
+    const entry = await api(`/api/library/${entryId}`);
+    const encounters = Array.isArray(entry.encounters) ? entry.encounters : [];
+    panel.innerHTML = encounters.length
+      ? `<ol>${encounters.map((encounter) => {
+          const title = encounter.article_title || encounter.source_url || "未知视频";
+          const titleMarkup = encounter.source_url
+            ? `<a href="${escapeHtml(encounter.source_url)}" target="_blank" rel="noreferrer">${escapeHtml(title)}</a>`
+            : `<strong>${escapeHtml(title)}</strong>`;
+          return `<li><div>${titleMarkup}<span>${escapeHtml(encounter.meaning || "")}</span></div><p>${escapeHtml(encounter.sentence)}</p></li>`;
+        }).join("")}</ol>`
+      : '<p class="library-detail-loading">没有找到遇见记录。</p>';
+    panel.dataset.loaded = "true";
+  } catch (error) {
+    panel.innerHTML = `<p class="analysis-error">${escapeHtml(error.message)}</p>`;
+  }
+}
+
 async function loadHistory() {
   try {
     const { items } = await api("/api/history");
@@ -235,6 +318,7 @@ async function openPlayer(url) {
     playerSentences = Array.isArray(data.sentences) ? data.sentences : [];
     activeSentenceIndex = -1;
     activeAnalysisUrl = data.analysis_url || `${url.replace(/\/$/, "")}/analysis`;
+    activeLibraryUrl = data.library_url || `${url.replace(/\/$/, "")}/library`;
     activeResegmentUrl = data.resegment_url || `${url.replace(/\/$/, "")}/resegment`;
     clearBoundarySelection();
     setSentenceLoop(false);
@@ -345,6 +429,7 @@ async function saveBoundaryEdit() {
     });
     playerSentences = Array.isArray(data.sentences) ? data.sentences : [];
     activeAnalysisUrl = data.analysis_url || activeAnalysisUrl;
+    activeLibraryUrl = data.library_url || activeLibraryUrl;
     activeResegmentUrl = data.resegment_url || activeResegmentUrl;
     activeSentenceIndex = -1;
     boundaryDialog.close();
@@ -415,29 +500,132 @@ function syncSentenceToAudio() {
   if (found >= 0) setActiveSentence(found, true);
 }
 
-function appendAnalysisSection(label, lines) {
+function libraryStatusText(state) {
+  const count = Number(state?.encounter_count) || 0;
+  const meaningCount = Number(state?.meaning_count) || 0;
+  const senses = meaningCount > 1 ? ` · ${meaningCount} 个语境释义` : "";
+  if (state?.context_saved) return `本句已记录 · 累计 ${count} 次${senses}`;
+  if (state?.exists && !state?.meaning_saved) {
+    return `已有原型 · 发现新语境释义 · 点击记录${senses}`;
+  }
+  if (state?.exists) return `词库已有 · 累计 ${count} 次 · 点击记录本句${senses}`;
+  return "点击存入个人词库";
+}
+
+function appendAnalysisSection(label, items, itemType) {
   const section = document.createElement("section");
   section.className = "analysis-section";
   const heading = document.createElement("h3");
   heading.textContent = label;
   section.appendChild(heading);
-  if (!lines.length) {
+  if (!items.length) {
     const empty = document.createElement("p");
     empty.className = "analysis-item muted";
     empty.textContent = "无";
     section.appendChild(empty);
   } else {
-    for (const line of lines) {
-      const item = document.createElement("p");
-      item.className = "analysis-item";
-      item.textContent = line;
-      section.appendChild(item);
-    }
+    const grid = document.createElement("div");
+    grid.className = "analysis-block-grid";
+    items.forEach((item, index) => {
+      const state = item.library || {};
+      const hasKanji = itemType === "vocabulary"
+        && /[\u3400-\u9fff]/u.test(`${item.expression || ""}${item.lemma || ""}`);
+      const readingMissing = hasKanji && !String(item.reading || "").trim();
+      const block = document.createElement("button");
+      block.type = "button";
+      block.className = `analysis-learning-block${state.context_saved ? " saved" : ""}${readingMissing ? " reading-missing" : ""}`;
+      block.dataset.libraryType = itemType;
+      block.dataset.libraryIndex = String(index);
+      block.disabled = Boolean(state.context_saved || readingMissing);
+
+      const top = document.createElement("span");
+      top.className = "analysis-block-top";
+      const expression = document.createElement("strong");
+      const surface = itemType === "vocabulary" ? item.expression : item.pattern;
+      const reading = readingMissing
+        ? "（读音待补充）"
+        : (itemType === "vocabulary" && item.reading ? `（${item.reading}）` : "");
+      expression.textContent = `${surface || "—"}${reading}`;
+      const badge = document.createElement("span");
+      badge.className = "analysis-kind-badge";
+      badge.textContent = itemType === "grammar"
+        ? "文法"
+        : (item.kind === "collocation" ? "搭配" : "单词");
+      top.append(expression, badge);
+
+      const lemma = document.createElement("span");
+      lemma.className = "analysis-block-lemma";
+      lemma.textContent = `原型：${item.lemma || surface || "—"}`;
+      const meaning = document.createElement("span");
+      meaning.className = "analysis-block-meaning";
+      meaning.textContent = itemType === "grammar"
+        ? (item.explanation || "—")
+        : (item.meaning || "—");
+      const status = document.createElement("span");
+      status.className = "analysis-block-status";
+      status.textContent = readingMissing
+        ? "模型仍未返回读音；请点击“重新分析”后再收藏"
+        : libraryStatusText(state);
+      block.append(top, lemma, meaning, status);
+      grid.appendChild(block);
+    });
+    section.appendChild(grid);
   }
   analysisContent.appendChild(section);
 }
 
+async function saveLearningBlock(block) {
+  if (!activeAnalysisData || !activeLibraryUrl || block.disabled) return;
+  const itemType = block.dataset.libraryType;
+  const index = Number(block.dataset.libraryIndex);
+  const source = itemType === "grammar"
+    ? activeAnalysisData.grammar
+    : activeAnalysisData.vocabulary;
+  const item = Array.isArray(source) ? source[index] : null;
+  if (!item) return;
+  const submitted = itemType === "grammar"
+    ? { pattern: item.pattern, lemma: item.lemma, explanation: item.explanation }
+    : {
+        kind: item.kind,
+        expression: item.expression,
+        lemma: item.lemma,
+        reading: item.reading || "",
+        meaning: item.meaning,
+      };
+  const status = block.querySelector(".analysis-block-status");
+  block.disabled = true;
+  if (status) status.textContent = "正在保存…";
+  try {
+    const data = await api(activeLibraryUrl, {
+      method: "POST",
+      body: JSON.stringify({
+        sentence_id: activeAnalysisData.sentence_id,
+        item_type: itemType,
+        item: submitted,
+      }),
+    });
+    item.library = data.library || {};
+    block.classList.toggle("saved", Boolean(item.library.context_saved));
+    block.disabled = Boolean(item.library.context_saved);
+    if (status) status.textContent = libraryStatusText(item.library);
+    if (item.library.added_entry) {
+      notify(`已把「${data.lemma}」加入个人词库`);
+    } else if (item.library.added_meaning) {
+      notify(`已为「${data.lemma}」添加新的语境释义`);
+    } else if (item.library.added_encounter) {
+      notify(`已累计「${data.lemma}」的学习次数`);
+    } else {
+      notify("本句中的这个条目已经记录过");
+    }
+  } catch (error) {
+    block.disabled = false;
+    if (status) status.textContent = libraryStatusText(item.library || {});
+    showError(error.message, "保存到个人词库失败");
+  }
+}
+
 function renderLearningAnalysis(data) {
+  activeAnalysisData = data;
   analysisContent.replaceChildren();
   const translation = document.createElement("p");
   translation.className = "analysis-translation";
@@ -445,15 +633,14 @@ function renderLearningAnalysis(data) {
   translationLabel.textContent = "整句翻译：";
   translation.append(translationLabel, document.createTextNode(String(data.translation || "—")));
   analysisContent.appendChild(translation);
-  const vocabulary = Array.isArray(data.vocabulary) ? data.vocabulary.map((item) => {
-    const reading = item.reading ? `（${item.reading}）` : "";
-    return `${item.expression || "—"}${reading}：${item.meaning || "—"}`;
-  }) : [];
-  appendAnalysisSection("词汇以及搭配：", vocabulary);
-  const grammar = Array.isArray(data.grammar) ? data.grammar.map((item) =>
-    `${item.pattern || "—"}：${item.explanation || "—"}`
-  ) : [];
-  appendAnalysisSection("文法：", grammar);
+  const hint = document.createElement("p");
+  hint.className = "analysis-library-hint";
+  hint.textContent = "点击下面的单词、搭配或文法块即可存入个人词库；同一条目在新句子中再次收藏会累计次数。";
+  analysisContent.appendChild(hint);
+  const vocabulary = Array.isArray(data.vocabulary) ? data.vocabulary : [];
+  appendAnalysisSection("词汇以及搭配：", vocabulary, "vocabulary");
+  const grammar = Array.isArray(data.grammar) ? data.grammar : [];
+  appendAnalysisSection("文法：", grammar, "grammar");
   analysisContent.scrollTop = 0;
 }
 
@@ -461,6 +648,7 @@ async function openSentenceAnalysis(index, button, force = false) {
   if (index < 0 || index >= playerSentences.length || !activeAnalysisUrl) return;
   const sentence = playerSentences[index];
   analysisSentenceIndex = index;
+  activeAnalysisData = null;
   analysisSentence.textContent = sentence.text || "";
   analysisCacheStatus.textContent = "";
   reanalyzeSentence.classList.add("hidden");
@@ -532,7 +720,20 @@ document.querySelector("#toggle-learning-key").addEventListener("click", (event)
   event.currentTarget.textContent = reveal ? "隐藏" : "显示";
 });
 document.querySelector("#close-error").addEventListener("click", () => errorDialog.close());
+document.querySelector("#open-library").addEventListener("click", openStudyLibrary);
+document.querySelector("#close-library").addEventListener("click", () => libraryDialog.close());
+libraryContent.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-library-count]");
+  if (button) toggleLibraryOccurrences(button);
+});
+exportLibrary.addEventListener("click", (event) => {
+  if (exportLibrary.getAttribute("aria-disabled") === "true") event.preventDefault();
+});
 document.querySelector("#close-analysis").addEventListener("click", () => analysisDialog.close());
+analysisContent.addEventListener("click", (event) => {
+  const block = event.target.closest("[data-library-type][data-library-index]");
+  if (block) saveLearningBlock(block);
+});
 document.querySelector("#close-boundary-dialog").addEventListener("click", () => boundaryDialog.close());
 document.querySelector("#cancel-boundary-edit").addEventListener("click", () => boundaryDialog.close());
 cancelBoundarySelectionButton.addEventListener("click", clearBoundarySelection);

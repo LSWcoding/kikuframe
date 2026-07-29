@@ -90,7 +90,15 @@ class SuccessfulAnalyzer:
         self.api_key = api_key
         self.captured = captured if captured is not None else {}
 
-    def analyze(self, sentence, config, cache_root, force=False):
+    def analyze(
+        self,
+        sentence,
+        config,
+        cache_root,
+        force=False,
+        known_items=None,
+        cache_scope=None,
+    ):
         self.captured.update(
             sentence=sentence,
             base_url=config.base_url,
@@ -98,6 +106,8 @@ class SuccessfulAnalyzer:
             api_key=self.api_key,
             cache_root=str(cache_root),
             force=force,
+            known_items=known_items or [],
+            cache_scope=cache_scope,
         )
         return (
             SentenceLearningAnalysis(
@@ -106,9 +116,17 @@ class SuccessfulAnalyzer:
                 model=config.model,
                 translation="第二句话的翻译。",
                 vocabulary=[
-                    {"expression": "第二句", "reading": "だいにく", "meaning": "第二句"}
+                    {
+                        "kind": "word",
+                        "expression": "第二句",
+                        "lemma": "第二句",
+                        "reading": "だいにく",
+                        "meaning": "第二句",
+                    }
                 ],
-                grammar=[{"pattern": "です", "explanation": "礼貌判断句。"}],
+                grammar=[
+                    {"pattern": "です", "lemma": "です", "explanation": "礼貌判断句。"}
+                ],
             ),
             False,
         )
@@ -193,6 +211,7 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
     assert player["sentence_count"] == 2
     assert player["sentences"][1]["start_ms"] == 1000
     assert player["analysis_url"] == f"/api/player/{started['job_id']}/analysis"
+    assert player["library_url"] == f"/api/player/{started['job_id']}/library"
     assert player["resegment_url"] == f"/api/player/{started['job_id']}/resegment"
     analysis = manager.analyze_sentence(started["job_id"], "s000002")
     assert analysis["translation"] == "第二句话的翻译。"
@@ -204,7 +223,28 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
         "api_key": "secret-key",
         "cache_root": str(tmp_path / "workspace" / "learning"),
         "force": False,
+        "known_items": [],
+        "cache_scope": manager._learning_context_key(
+            manager._record(started["job_id"]), "s000002", "第二句话。"
+        ),
     }
+    saved = manager.save_learning_item(
+        started["job_id"],
+        "s000002",
+        "vocabulary",
+        analysis["vocabulary"][0],
+    )
+    assert saved["library"]["added_entry"] is True
+    assert saved["library"]["encounter_count"] == 1
+    assert saved["library"]["context_saved"] is True
+    duplicate = manager.save_learning_item(
+        started["job_id"],
+        "s000002",
+        "vocabulary",
+        analysis["vocabulary"][0],
+    )
+    assert duplicate["library"]["added_encounter"] is False
+    assert duplicate["library"]["encounter_count"] == 1
     resegmented = manager.resegment_sentences(
         started["job_id"],
         ["s000001", "s000002"],
@@ -349,17 +389,27 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
         assert 'id="boundary-toolbar"' in html
         assert 'id="boundary-dialog"' in html
         assert 'id="boundary-editor-text"' in html
+        assert 'id="open-library"' in html
+        assert 'id="library-dialog"' in html
+        assert 'id="export-library"' in html
 
         with urlopen(f"{base}/assets/app.js", timeout=2) as response:
             script = response.read().decode()
         assert '"failed", ["partial", "failed", "interrupted"]' in script
         assert "data-sentence-index" in script
         assert "data-analysis-index" in script
+        assert "data-library-type" in script
+        assert "saveLearningBlock" in script
+        assert "reading-missing" in script
+        assert "读音待补充" in script
         assert "sentenceLoopEnabled" in script
         assert "force" in script
         assert "boundarySelectionAnchor" in script
         assert "activeResegmentUrl" in script
         assert "saveBoundaryEdit" in script
+        assert "openStudyLibrary" in script
+        assert "toggleLibraryOccurrences" in script
+        assert "/api/library/export" in script
 
         with urlopen(f"{base}/api/config", timeout=2) as response:
             config = json.loads(response.read())
@@ -428,6 +478,7 @@ def test_http_player_supports_clickable_sentences_and_ranges(tmp_path: Path) -> 
         assert player["sentences"][0]["text"] == "第一句话。"
         assert player["audio_url"].endswith("/audio")
         assert player["analysis_url"].endswith("/analysis")
+        assert player["library_url"].endswith("/library")
 
         analysis_request = Request(
             f"{base}{player['analysis_url']}",
@@ -440,6 +491,42 @@ def test_http_player_supports_clickable_sentences_and_ranges(tmp_path: Path) -> 
         assert analysis["translation"] == "第二句话的翻译。"
         assert analysis["vocabulary"][0]["reading"] == "だいにく"
 
+        library_request = Request(
+            f"{base}{player['library_url']}",
+            data=json.dumps(
+                {
+                    "sentence_id": "s000001",
+                    "item_type": "vocabulary",
+                    "item": analysis["vocabulary"][0],
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(library_request, timeout=2) as response:
+            library_result = json.loads(response.read())
+        assert library_result["library"]["context_saved"] is True
+        assert library_result["library"]["encounter_count"] == 1
+
+        with urlopen(f"{base}/api/library", timeout=2) as response:
+            library = json.loads(response.read())
+        assert library["entry_count"] == 1
+        assert library["encounter_count"] == 1
+        assert library["items"][0]["lemma"] == "第二句"
+        assert library["items"][0]["display"] == "第二句"
+        entry_id = library["items"][0]["entry_id"]
+
+        with urlopen(f"{base}/api/library/{entry_id}", timeout=2) as response:
+            library_entry = json.loads(response.read())
+        assert library_entry["encounters"][0]["sentence"] == "第一句话。"
+        assert library_entry["encounters"][0]["article_title"] == "播放器测试"
+
+        with urlopen(f"{base}/api/library/export", timeout=2) as response:
+            exported_library = response.read().decode()
+            disposition = response.headers["Content-Disposition"]
+        assert exported_library == "第二句（だいにく）：第二句\n"
+        assert "KikuFrame-%E5%8D%95%E8%AF%8D%E5%BA%93.md" in disposition
+
         request = Request(
             f"{base}{player['audio_url']}",
             headers={"Range": "bytes=2-5"},
@@ -451,3 +538,30 @@ def test_http_player_supports_clickable_sentences_and_ranges(tmp_path: Path) -> 
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_history_paths_survive_project_directory_rename(tmp_path: Path) -> None:
+    audio = tmp_path / "output" / "sample.m4a"
+    sentences = tmp_path / "workspace" / "sample" / "sentences.json"
+    audio.parent.mkdir(parents=True)
+    sentences.parent.mkdir(parents=True)
+    audio.write_bytes(b"audio")
+    sentences.write_text("{}\n", encoding="utf-8")
+
+    manager = ExtractionJobManager(tmp_path)
+    record = {
+        "job_id": "renamed-project-job",
+        "status": "succeeded",
+        "audio_path": "/old/location/youtube-subtitle-md/output/sample.m4a",
+        "sentences_path": (
+            "/old/location/youtube-subtitle-md/workspace/sample/sentences.json"
+        ),
+    }
+
+    assert manager._validated_project_file(record["audio_path"], "output") == audio.resolve()
+    assert manager._validated_project_file(
+        record["sentences_path"], "workspace"
+    ) == sentences.resolve()
+    assert manager._public_record(record)["player_url"] == (
+        "/api/player/renamed-project-job"
+    )

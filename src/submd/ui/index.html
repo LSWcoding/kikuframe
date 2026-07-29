@@ -16,7 +16,10 @@
           <h1>AI 日语视频学习工具</h1>
           <p class="subtitle">把日语视频转换成可点击、可循环、可纠错、可分析的逐句学习材料。</p>
         </div>
-        <span class="local-badge"><span></span>仅本机访问</span>
+        <div class="hero-actions">
+          <button id="open-library" class="library-open-button" type="button">单词库</button>
+          <span class="local-badge"><span></span>仅本机访问</span>
+        </div>
       </header>
 
       <section class="panel form-panel" aria-labelledby="config-title">
@@ -181,6 +184,25 @@
         </div>
       </section>
     </main>
+
+    <dialog id="library-dialog" class="library-dialog" aria-labelledby="library-title">
+      <div class="analysis-header library-header">
+        <div>
+          <p class="section-index">PERSONAL LIBRARY</p>
+          <h2 id="library-title">单词库</h2>
+          <p id="library-summary" class="muted">正在读取本地学习记录…</p>
+        </div>
+        <div class="library-header-actions">
+          <a id="export-library" class="library-export-button" href="/api/library/export"
+            download>导出 Markdown</a>
+          <button id="close-library" class="dialog-close" type="button"
+            aria-label="关闭单词库">×</button>
+        </div>
+      </div>
+      <div id="library-content" class="library-content" tabindex="0">
+        <p class="library-empty">还没有收藏单词、搭配或文法。</p>
+      </div>
+    </dialog>
 
     <dialog id="analysis-dialog" class="analysis-dialog" aria-labelledby="analysis-title">
       <div class="analysis-header">

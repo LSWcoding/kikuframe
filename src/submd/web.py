@@ -29,14 +29,17 @@ from submd.learning import SentenceAnalyzer
 from submd.models import (
     CloudOcrConfig,
     ExtractionConfig,
+    GrammarAnalysisItem,
     LanguageLearningConfig,
     OrganizedSubtitleDocument,
     SubtitleDocument,
     TextLlmConfig,
+    VocabularyAnalysisItem,
     YouTubeCaptionTrack,
 )
 from submd.organize import SubtitleOrganizer, write_fallback_player_document
 from submd.pipeline import BurnedSubtitlePipeline
+from submd.study_library import StudyLibrary
 
 PipelineFactory = Callable[[Callable[[str], None], str], BurnedSubtitlePipeline]
 OrganizerFactory = Callable[[Callable[[str], None], str], SubtitleOrganizer]
@@ -112,6 +115,9 @@ class ExtractionJobManager:
         self.project_root = project_root.expanduser().resolve()
         self.environment = EnvironmentStore(self.project_root / ".env")
         self.history_path = self.project_root / "workspace" / "ui_history.json"
+        self.study_library = StudyLibrary(
+            self.project_root / "workspace" / "learning" / "library.sqlite3"
+        )
         self.pipeline_factory = pipeline_factory or self._default_pipeline
         self.organizer_factory = organizer_factory or self._default_organizer
         self.analyzer_factory = analyzer_factory or self._default_analyzer
@@ -194,6 +200,52 @@ class ExtractionJobManager:
         with self._lock:
             return [self._public_record(item) for item in self._history]
 
+    def learning_library(self) -> dict[str, Any]:
+        items = self.study_library.list_entries()
+        return {
+            "items": items,
+            "entry_count": len(items),
+            "encounter_count": sum(int(item["encounter_count"]) for item in items),
+            "export_url": "/api/library/export",
+        }
+
+    def learning_library_entry(self, entry_id: int) -> dict[str, Any]:
+        if entry_id < 1:
+            raise ValueError("词库条目 ID 无效")
+        entry = self.study_library.entry_details(entry_id)
+        if entry is None:
+            raise KeyError(entry_id)
+        with self._lock:
+            records = {
+                str(record.get("job_id") or ""): dict(record)
+                for record in [*self._history, *self._jobs.values()]
+            }
+        enriched_encounters: list[dict[str, Any]] = []
+        for encounter in entry["encounters"]:
+            record = records.get(str(encounter.get("job_id") or ""), {})
+            result_name = str(record.get("result_name") or "").strip()
+            source_url = str(encounter.get("source_url") or "")
+            enriched_encounters.append(
+                encounter
+                | {
+                    "article_title": Path(result_name).stem if result_name else source_url,
+                }
+            )
+        return entry | {"encounters": enriched_encounters}
+
+    def export_learning_library(self) -> Path:
+        items = self.study_library.list_entries()
+        lines: list[str] = []
+        for item in items:
+            lemma = str(item["display"])
+            reading = str(item["reading"])
+            headword = f"{lemma}（{reading}）" if reading else lemma
+            meanings = "；".join(str(value) for value in item["meanings"])
+            lines.append(f"{headword}：{meanings}")
+        path = self.project_root / "output" / "KikuFrame-单词库.md"
+        write_text(path, "\n".join(lines) + ("\n" if lines else ""))
+        return path
+
     def result_file(self, job_id: str, result_kind: str | None = None) -> Path:
         with self._lock:
             record = self._jobs.get(job_id) or next(
@@ -214,11 +266,7 @@ class ExtractionJobManager:
                 raw_path = record.get("result_path")
         if not raw_path:
             raise FileNotFoundError(job_id)
-        path = Path(str(raw_path)).expanduser().resolve()
-        output_root = (self.project_root / "output").resolve()
-        if not path.is_relative_to(output_root) or not path.is_file():
-            raise FileNotFoundError(job_id)
-        return path
+        return self._validated_project_file(raw_path, "output")
 
     def player_data(self, job_id: str) -> dict[str, Any]:
         record = self._record(job_id)
@@ -236,6 +284,7 @@ class ExtractionJobManager:
             "sentence_count": len(document.sentences),
             "audio_url": f"/api/player/{job_id}/audio",
             "analysis_url": f"/api/player/{job_id}/analysis",
+            "library_url": f"/api/player/{job_id}/library",
             "resegment_url": f"/api/player/{job_id}/resegment",
             "sentences": [sentence.model_dump() for sentence in document.sentences],
         }
@@ -300,21 +349,7 @@ class ExtractionJobManager:
     def analyze_sentence(
         self, job_id: str, sentence_id: str, force: bool = False
     ) -> dict[str, Any]:
-        if not sentence_id.strip():
-            raise ValueError("请选择要分析的句子")
-        record = self._record(job_id)
-        sentences_path = self._validated_project_file(record.get("sentences_path"), "workspace")
-        try:
-            document = OrganizedSubtitleDocument.model_validate_json(
-                sentences_path.read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError) as exc:
-            raise FileNotFoundError(job_id) from exc
-        sentence = next(
-            (item for item in document.sentences if item.sentence_id == sentence_id), None
-        )
-        if sentence is None:
-            raise ValueError("该句子不属于当前视频")
+        record, sentence = self._learning_sentence(job_id, sentence_id)
 
         values = self.environment.read_private()
         base_url = (
@@ -331,16 +366,122 @@ class ExtractionJobManager:
         if not base_url or not model or not api_key:
             raise ValueError("请先配置语言学习模型的地址、模型名称和 API Key")
         analyzer = self.analyzer_factory(api_key)
+        known_items = self.study_library.context_for_analysis(sentence.text)
+        context_key = self._learning_context_key(record, sentence.sentence_id, sentence.text)
         analysis, cached = analyzer.analyze(
             sentence=sentence.text,
             config=LanguageLearningConfig(base_url=base_url, model=model),
             cache_root=self.project_root / "workspace" / "learning",
             force=force,
+            known_items=known_items,
+            cache_scope=context_key,
         )
-        return analysis.model_dump(mode="json") | {
+        payload = analysis.model_dump(mode="json")
+        payload["vocabulary"] = [
+            item.model_dump(mode="json")
+            | {
+                "library": self.study_library.state_for(
+                    kind=item.kind,
+                    lemma=item.lemma,
+                    reading=item.reading,
+                    meaning=item.meaning,
+                    context_key=context_key,
+                )
+            }
+            for item in analysis.vocabulary
+        ]
+        payload["grammar"] = [
+            item.model_dump(mode="json")
+            | {
+                "library": self.study_library.state_for(
+                    kind="grammar",
+                    lemma=item.lemma,
+                    reading="",
+                    meaning=item.explanation,
+                    context_key=context_key,
+                )
+            }
+            for item in analysis.grammar
+        ]
+        return payload | {
             "sentence_id": sentence.sentence_id,
             "cached": cached,
+            "library_context_count": len(known_items),
         }
+
+    def save_learning_item(
+        self,
+        job_id: str,
+        sentence_id: str,
+        item_type: str,
+        raw_item: Any,
+    ) -> dict[str, Any]:
+        record, sentence = self._learning_sentence(job_id, sentence_id)
+        if not isinstance(raw_item, dict):
+            raise ValueError("学习词库条目必须是对象")
+        if item_type == "vocabulary":
+            item = VocabularyAnalysisItem.model_validate(raw_item)
+            kind = item.kind
+            lemma = item.lemma
+            surface = item.expression
+            reading = item.reading
+            meaning = item.meaning
+        elif item_type == "grammar":
+            grammar = GrammarAnalysisItem.model_validate(raw_item)
+            kind = "grammar"
+            lemma = grammar.lemma
+            surface = grammar.pattern
+            reading = ""
+            meaning = grammar.explanation
+        else:
+            raise ValueError("item_type 必须是 vocabulary 或 grammar")
+        state = self.study_library.save(
+            kind=kind,
+            lemma=lemma,
+            surface=surface,
+            reading=reading,
+            meaning=meaning,
+            context_key=self._learning_context_key(record, sentence.sentence_id, sentence.text),
+            source_url=str(record.get("source_url") or ""),
+            job_id=job_id,
+            sentence_id=sentence.sentence_id,
+            sentence=sentence.text,
+        )
+        return {
+            "sentence_id": sentence.sentence_id,
+            "item_type": item_type,
+            "lemma": lemma,
+            "library": state,
+        }
+
+    def _learning_sentence(self, job_id: str, sentence_id: str) -> tuple[dict[str, Any], Any]:
+        if not sentence_id.strip():
+            raise ValueError("请选择要分析的句子")
+        record = self._record(job_id)
+        sentences_path = self._validated_project_file(record.get("sentences_path"), "workspace")
+        try:
+            document = OrganizedSubtitleDocument.model_validate_json(
+                sentences_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError(job_id) from exc
+        sentence = next(
+            (item for item in document.sentences if item.sentence_id == sentence_id), None
+        )
+        if sentence is None:
+            raise ValueError("该句子不属于当前视频")
+        return record, sentence
+
+    def _learning_context_key(self, record: dict[str, Any], sentence_id: str, text: str) -> str:
+        source_url = str(record.get("source_url") or "")
+        source_key = self._youtube_video_id(source_url) or source_url
+        return hashlib.sha256(
+            json.dumps(
+                {"source": source_key, "sentence_id": sentence_id, "text": text},
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
 
     def player_audio_file(self, job_id: str) -> Path:
         return self._validated_project_file(self._record(job_id).get("audio_path"), "output")
@@ -401,9 +542,18 @@ class ExtractionJobManager:
             raise FileNotFoundError(root_name)
         path = Path(str(raw_path)).expanduser().resolve()
         allowed_root = (self.project_root / root_name).resolve()
-        if not path.is_relative_to(allowed_root) or not path.is_file():
-            raise FileNotFoundError(path)
-        return path
+        if path.is_relative_to(allowed_root) and path.is_file():
+            return path
+
+        # History stores absolute paths. If the project directory was renamed or moved,
+        # safely resolve the suffix below its former output/workspace directory again.
+        if root_name in path.parts:
+            reversed_parts = tuple(reversed(path.parts))
+            root_index = len(path.parts) - 1 - reversed_parts.index(root_name)
+            relocated = allowed_root.joinpath(*path.parts[root_index + 1 :]).resolve()
+            if relocated.is_relative_to(allowed_root) and relocated.is_file():
+                return relocated
+        raise FileNotFoundError(path)
 
     def _run(self, job_id: str, values: dict[str, str]) -> None:
         def status(message: str) -> None:
@@ -852,9 +1002,12 @@ class ExtractionJobManager:
             public["results"] = public_results
         if record.get("result_path"):
             public["download_url"] = f"/api/files/{record['job_id']}"
-        audio_path = Path(str(record.get("audio_path") or "")).expanduser()
-        sentences_path = Path(str(record.get("sentences_path") or "")).expanduser()
-        if audio_path.is_file() and sentences_path.is_file():
+        try:
+            self._validated_project_file(record.get("audio_path"), "output")
+            self._validated_project_file(record.get("sentences_path"), "workspace")
+        except FileNotFoundError:
+            pass
+        else:
             public["player_url"] = f"/api/player/{record['job_id']}"
         return public
 
@@ -877,6 +1030,19 @@ class UiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(self.server.manager.config())
             elif path == "/api/history":
                 self._send_json({"items": self.server.manager.history()})
+            elif path == "/api/library":
+                self._send_json(self.server.manager.learning_library())
+            elif path == "/api/library/export":
+                self._send_file(
+                    self.server.manager.export_learning_library(), download=True
+                )
+            elif path.startswith("/api/library/"):
+                raw_entry_id = path.removeprefix("/api/library/")
+                try:
+                    entry_id = int(raw_entry_id)
+                except ValueError as exc:
+                    raise FileNotFoundError(path) from exc
+                self._send_json(self.server.manager.learning_library_entry(entry_id))
             elif path.startswith("/api/player/"):
                 parts = path.removeprefix("/api/player/").split("/", maxsplit=1)
                 job_id = parts[0]
@@ -947,6 +1113,18 @@ class UiRequestHandler(BaseHTTPRequestHandler):
                         job_id,
                         str(payload.get("sentence_id") or ""),
                         force=force,
+                    )
+                )
+            elif path.startswith("/api/player/") and path.endswith("/library"):
+                job_id = path.removeprefix("/api/player/").removesuffix("/library").strip("/")
+                if not job_id:
+                    raise ValueError("播放器任务 ID 为空")
+                self._send_json(
+                    self.server.manager.save_learning_item(
+                        job_id=job_id,
+                        sentence_id=str(payload.get("sentence_id") or ""),
+                        item_type=str(payload.get("item_type") or ""),
+                        raw_item=payload.get("item"),
                     )
                 )
             else:
