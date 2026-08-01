@@ -28,7 +28,7 @@ from submd.models import (
 
 StatusCallback = Callable[[str], None]
 
-_PROMPT_VERSION = "semantic-character-boundaries-v6"
+_PROMPT_VERSION = "semantic-candidate-boundaries-v7"
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 _TIMESTAMP = r"\d{2}(?::\d{2})?:\d{2}\.\d{3}"
 _TIMED_SUBTITLE = re.compile(
@@ -37,6 +37,44 @@ _TIMED_SUBTITLE = re.compile(
 )
 _REVIEW_MARK = re.compile(r"\s*⚠\ufe0f?\s*$")
 _TERMINAL_UNIT = re.compile(r".+?(?:[。！？!?]+|\.(?=\s|$)|$)", re.DOTALL)
+_TERMINAL_PUNCTUATION = frozenset("。．.!！?？…‥")
+_NONTERMINAL_PUNCTUATION = frozenset("、，,：:；;")
+_CLOSING_PUNCTUATION = frozenset("」』）】〕〉》”’〟\"'")
+_LEADING_TERMINAL_PUNCTUATION = re.compile(r"^[。．.!！?？…‥]+[」』）】〕〉》”’〟\"']*")
+_UNFINISHED_UNIT_END = re.compile(
+    r"(?:[、，,：:；;]|は|が|を|に|で|と|へ|の|から|ので|けど|けれど|けれども|"
+    r"そして|それで|でも|つまり|という|って|たり|たら|なら|て)$"
+)
+_INTERIOR_SENTENCE_ENDING = re.compile(
+    r"(?:ではありませんでした|じゃありませんでした|ませんでした|"
+    r"ありがとうございました|ではありません|じゃありません|ございません|"
+    r"じゃなかった|ではなかった|なかった|ございました|いたしました|"
+    r"お願いしました|でした|ました|でしょうか|でしょう|ですか|ますか|"
+    r"ございます|いたします|お願いします|ください|ません|じゃない|"
+    r"ではない|と思います|と思う|んです|のです|だった|なのだ|のだ|"
+    r"ありがとう|ごめんなさい|すみません|です|ます|んだ|たい)"
+    r"(?:よね|ですね|ますね|だよね|かな|かね|ね|よ|か)?"
+)
+_PROTECTED_EXPRESSIONS = (
+    "ありがとうございます",
+    "ありがとうございました",
+    "ありがとうございません",
+    "よろしくお願いします",
+    "よろしくお願いいたします",
+    "お願い申し上げます",
+    "お願いいたします",
+    "お願いできます",
+    "お願いできません",
+    "失礼いたします",
+    "失礼しました",
+    "いただきます",
+    "いただきました",
+    "いただけます",
+    "いただけません",
+    "ございます",
+    "ございました",
+    "ございません",
+)
 
 _SYSTEM_PROMPT = """You determine semantic sentence boundaries in subtitle fragments.
 
@@ -46,10 +84,9 @@ youtube_reading_reference. Context exists only to understand sentences crossing 
 
 Rules:
 1. Return a boundary when a grammatically and semantically complete spoken sentence ends. A
-   subtitle screen change is not a sentence boundary. Boundaries may occur inside a target unit.
-2. Each boundary contains a target unit_id and after_char: the 1-based Unicode character count
-   after which the sentence ends. It must be between 1 and the supplied text_length. A boundary at
-   the end of a unit is exactly after_char=text_length, never text_length+1.
+   subtitle screen change is not a sentence boundary.
+2. Every target unit supplies allowed_after_chars. Each boundary contains a target unit_id and an
+   after_char selected verbatim from that unit's allowed_after_chars. Never invent another offset.
 3. Return IDs only from target_units, never from either context array.
 4. Do not translate, rewrite, correct, summarize, or reproduce subtitle text.
 5. Do not mark the last target merely because it is the end of a chunk; use after_context.
@@ -62,6 +99,8 @@ Rules:
    one-line sentence from a phrase that depends on the next unit for its meaning.
 9. Avoid merging multiple complete claims into one very long sentence. A change from one complete
    claim or question to the next should normally be a boundary even when punctuation is missing.
+10. Never split inside a word, inflection, auxiliary chain, honorific formula, or fixed expression.
+    In particular, ありがとうございます, ございます, and お願いいたします must remain intact.
 
 Examples:
 - u000001="フリーダー", u000002="ですさっき病院に行ったら" -> boundaries after
@@ -96,6 +135,65 @@ class SubtitleUnit:
         if self.youtube_reading_reference:
             payload["youtube_reading_reference"] = list(self.youtube_reading_reference)
         return payload
+
+
+def _protected_expression_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for expression in _PROTECTED_EXPRESSIONS:
+        start = 0
+        while (index := text.find(expression, start)) >= 0:
+            spans.append((index, index + len(expression)))
+            start = index + 1
+    return spans
+
+
+def _inside_protected_expression(offset: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start < offset < end for start, end in spans)
+
+
+def _allowed_boundary_offsets(text: str) -> tuple[int, ...]:
+    """Return conservative sentence-boundary candidates for one immutable unit."""
+    if not text:
+        return ()
+    candidates: set[int] = set()
+    protected_spans = _protected_expression_spans(text)
+
+    index = 0
+    while index < len(text):
+        if text[index] not in _TERMINAL_PUNCTUATION:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] in _TERMINAL_PUNCTUATION:
+            end += 1
+        while end < len(text) and text[end] in _CLOSING_PUNCTUATION:
+            end += 1
+        candidates.add(end)
+        index = end
+
+    for match in _INTERIOR_SENTENCE_ENDING.finditer(text):
+        offset = match.end()
+        if offset >= len(text):
+            continue
+        if text[offset] in _TERMINAL_PUNCTUATION | _NONTERMINAL_PUNCTUATION:
+            continue
+        if not _inside_protected_expression(offset, protected_spans):
+            candidates.add(offset)
+
+    if not _UNFINISHED_UNIT_END.search(text):
+        candidates.add(len(text))
+
+    return tuple(
+        sorted(
+            offset
+            for offset in candidates
+            if 0 < offset <= len(text) and not _inside_protected_expression(offset, protected_spans)
+        )
+    )
+
+
+def _target_unit_payload(unit: SubtitleUnit) -> dict[str, Any]:
+    return unit.as_payload() | {"allowed_after_chars": list(_allowed_boundary_offsets(unit.text))}
 
 
 @dataclass(frozen=True)
@@ -261,7 +359,7 @@ class OpenAICompatibleBoundaryEngine:
         context_ids = {unit.unit_id for unit in [*before_context, *after_context]}
         user_payload = {
             "before_context": [unit.as_payload() for unit in before_context],
-            "target_units": [unit.as_payload() for unit in target_units],
+            "target_units": [_target_unit_payload(unit) for unit in target_units],
             "after_context": [unit.as_payload() for unit in after_context],
         }
         payload: dict[str, Any] = {
@@ -281,26 +379,32 @@ class OpenAICompatibleBoundaryEngine:
         last_error: Exception | None = None
         for format_attempt in range(2):
             response = self._post_with_retries(payload)
+            response_content: str | None = None
             try:
                 envelope = response.json()
                 content = envelope["choices"][0]["message"]["content"]
-                parsed = self._extract_json(self._content_text(content))
+                response_content = self._content_text(content)
+                parsed = self._extract_json(response_content)
                 raw_boundaries = parsed.get("boundaries")
                 legacy_values = parsed.get("break_after")
                 if raw_boundaries is None and isinstance(legacy_values, list):
                     raw_boundaries = [
-                        {"unit_id": unit_id, "after_char": len(next(
-                            unit.text
-                            for unit in [*before_context, *target_units, *after_context]
-                            if unit.unit_id == unit_id
-                        ))}
+                        {
+                            "unit_id": unit_id,
+                            "after_char": len(
+                                next(
+                                    unit.text
+                                    for unit in [*before_context, *target_units, *after_context]
+                                    if unit.unit_id == unit_id
+                                )
+                            ),
+                        }
                         for unit_id in legacy_values
                     ]
                 if not isinstance(raw_boundaries, list):
                     raise ValueError("boundaries must be an array")
                 all_units = {
-                    unit.unit_id: unit
-                    for unit in [*before_context, *target_units, *after_context]
+                    unit.unit_id: unit for unit in [*before_context, *target_units, *after_context]
                 }
                 parsed_boundaries: list[tuple[str, int]] = []
                 for item in raw_boundaries:
@@ -339,6 +443,23 @@ class OpenAICompatibleBoundaryEngine:
                     for unit_id, offset in normalized_boundaries
                     if unit_id in target_ids
                 ]
+                allowed_by_id = {
+                    unit.unit_id: set(_allowed_boundary_offsets(unit.text)) for unit in target_units
+                }
+                disallowed = [
+                    {
+                        "unit_id": unit_id,
+                        "after_char": offset,
+                        "allowed_after_chars": sorted(allowed_by_id[unit_id]),
+                    }
+                    for unit_id, offset in target_boundaries
+                    if offset not in allowed_by_id[unit_id]
+                ]
+                if disallowed:
+                    raise ValueError(
+                        "response selected forbidden sentence boundaries: "
+                        + json.dumps(disallowed, ensure_ascii=False)
+                    )
                 return BoundaryResult(
                     break_after=frozenset(
                         unit_id
@@ -356,8 +477,30 @@ class OpenAICompatibleBoundaryEngine:
             except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
                 if format_attempt == 0:
+                    self._request_boundary_repair(payload, response_content, str(exc))
                     continue
         raise OrganizeError(f"无法解析文本模型的断句结果：{last_error}") from last_error
+
+    @staticmethod
+    def _request_boundary_repair(
+        payload: dict[str, Any], previous_content: str | None, reason: str
+    ) -> None:
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return
+        if previous_content:
+            messages.append({"role": "assistant", "content": previous_content})
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "The previous boundary response was rejected: "
+                    f"{reason[:1800]}. Return corrected JSON only. Select after_char values "
+                    "exclusively from each target unit's allowed_after_chars and omit any "
+                    "uncertain boundary."
+                ),
+            }
+        )
 
     def _post_with_retries(self, payload: dict[str, Any]) -> httpx.Response:
         headers = {
@@ -658,9 +801,7 @@ class SubtitleOrganizer:
                     )
                 )
                 if end_offset in offsets:
-                    sentence = SubtitleOrganizer._sentence_from_units(
-                        pieces, len(sentences) + 1
-                    )
+                    sentence = SubtitleOrganizer._sentence_from_units(pieces, len(sentences) + 1)
                     if sentence is not None:
                         sentences.append(sentence)
                     pieces = []
@@ -669,7 +810,47 @@ class SubtitleOrganizer:
             sentence = SubtitleOrganizer._sentence_from_units(pieces, len(sentences) + 1)
             if sentence is not None:
                 sentences.append(sentence)
-        return sentences
+        return SubtitleOrganizer._reattach_leading_terminal_punctuation(sentences)
+
+    @staticmethod
+    def _reattach_leading_terminal_punctuation(
+        sentences: list[OrganizedSentence],
+    ) -> list[OrganizedSentence]:
+        """Move sentence-leading terminal punctuation back to the preceding sentence."""
+        merged: list[OrganizedSentence] = []
+        for sentence in sentences:
+            match = _LEADING_TERMINAL_PUNCTUATION.match(sentence.text)
+            if not merged or match is None:
+                merged.append(sentence)
+                continue
+
+            prefix = match.group(0)
+            remainder = sentence.text[len(prefix) :]
+            duration = max(0, sentence.end_ms - sentence.start_ms)
+            punctuation_end_ms = sentence.start_ms + round(
+                duration * len(prefix) / max(1, len(sentence.text))
+            )
+            previous = merged[-1]
+            merged[-1] = previous.model_copy(
+                update={
+                    "text": previous.text + prefix,
+                    "end_ms": max(previous.end_ms, punctuation_end_ms),
+                    "source_unit_ids": list(
+                        dict.fromkeys([*previous.source_unit_ids, *sentence.source_unit_ids])
+                    ),
+                    "source_segment_ids": list(
+                        dict.fromkeys([*previous.source_segment_ids, *sentence.source_segment_ids])
+                    ),
+                }
+            )
+            if remainder:
+                merged.append(
+                    sentence.model_copy(update={"text": remainder, "start_ms": punctuation_end_ms})
+                )
+        return [
+            sentence.model_copy(update={"sentence_id": f"s{index:06d}"})
+            for index, sentence in enumerate(merged, 1)
+        ]
 
     @staticmethod
     def _sentence_from_units(
@@ -679,9 +860,7 @@ class SubtitleOrganizer:
         if not text:
             return None
         source_ids = list(
-            dict.fromkeys(
-                source_id for unit in units for source_id in unit.source_segment_ids
-            )
+            dict.fromkeys(source_id for unit in units for source_id in unit.source_segment_ids)
         )
         return OrganizedSentence(
             sentence_id=f"s{sentence_index:06d}",
@@ -709,11 +888,18 @@ class SubtitleOrganizer:
             return set()
         source_characters: list[str] = []
         source_positions: list[tuple[str, int]] = []
+        raw_source_characters: list[str] = []
+        raw_source_positions: list[tuple[str, int]] = []
+        raw_index_by_position: dict[tuple[str, int], int] = {}
         for unit in units:
             for offset, character in enumerate(unit.text, 1):
+                position = (unit.unit_id, offset)
+                raw_index_by_position[position] = len(raw_source_characters)
+                raw_source_characters.append(character)
+                raw_source_positions.append(position)
                 for comparable in _comparable_characters(character):
                     source_characters.append(comparable)
-                    source_positions.append((unit.unit_id, offset))
+                    source_positions.append(position)
 
         caption_text = "".join(cue.text for cue in reference_track.cues)
         caption_text = re.sub(r"\[[^\]]*]|【[^】]*】", "", caption_text)
@@ -763,7 +949,25 @@ class SubtitleOrganizer:
             source_index = reference_to_source.get(last_reference_index)
             if source_index is None:
                 continue
-            boundaries.add(source_positions[source_index])
+            boundary = source_positions[source_index]
+            raw_index = raw_index_by_position[boundary]
+            cursor = raw_index + 1
+            if (
+                cursor < len(raw_source_characters)
+                and raw_source_characters[cursor] in _TERMINAL_PUNCTUATION
+            ):
+                while (
+                    cursor < len(raw_source_characters)
+                    and raw_source_characters[cursor] in _TERMINAL_PUNCTUATION
+                ):
+                    cursor += 1
+                while (
+                    cursor < len(raw_source_characters)
+                    and raw_source_characters[cursor] in _CLOSING_PUNCTUATION
+                ):
+                    cursor += 1
+                boundary = raw_source_positions[cursor - 1]
+            boundaries.add(boundary)
         return boundaries
 
     @staticmethod

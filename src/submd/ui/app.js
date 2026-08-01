@@ -6,14 +6,13 @@ const jobStatus = document.querySelector("#job-status");
 const jobUrl = document.querySelector("#job-url");
 const jobResult = document.querySelector("#job-result");
 const resultLinks = document.querySelector("#result-links");
+const cancelJobButton = document.querySelector("#cancel-job");
 const historyBody = document.querySelector("#history-body");
+const clearHistoryButton = document.querySelector("#clear-history");
 const errorDialog = document.querySelector("#error-dialog");
 const errorTitle = document.querySelector("#error-title");
 const errorMessage = document.querySelector("#error-message");
-const apiKeyInput = document.querySelector("#api-key");
-const keyHint = document.querySelector("#key-hint");
-const learningApiKeyInput = document.querySelector("#learning-api-key");
-const learningKeyHint = document.querySelector("#learning-key-hint");
+const sharedValueInputs = [...document.querySelectorAll("[data-shared-type]")];
 const toast = document.querySelector("#toast");
 const playerPanel = document.querySelector("#player-panel");
 const playerTitle = document.querySelector("#player-title");
@@ -44,6 +43,7 @@ const librarySummary = document.querySelector("#library-summary");
 const exportLibrary = document.querySelector("#export-library");
 
 let pollingTimer = null;
+let activeJobId = "";
 let playerSentences = [];
 let activeSentenceIndex = -1;
 let activeAnalysisUrl = "";
@@ -52,6 +52,7 @@ let activeAnalysisData = null;
 let sentenceLoopEnabled = false;
 let analysisSentenceIndex = -1;
 let activeResegmentUrl = "";
+let activeSentenceDeleteUrl = "";
 let boundarySelectionAnchor = -1;
 let boundarySelectionEnd = -1;
 let boundaryLongPressTimer = null;
@@ -84,17 +85,68 @@ function fillForm(config) {
     const input = form.elements.namedItem(key);
     if (input) input.value = value || "";
   }
-  const configured = Boolean(config.SUBMD_OCR_API_KEY_CONFIGURED);
-  keyHint.textContent = configured ? "已配置；留空将保留现有 Key" : "尚未配置";
-  apiKeyInput.placeholder = configured ? "••••••••（留空保持不变）" : "输入后保存在本机";
-  apiKeyInput.required = !configured;
-  const learningConfigured = Boolean(config.SUBMD_LEARNING_API_KEY_CONFIGURED);
-  learningKeyHint.textContent = learningConfigured
-    ? "已单独配置；留空将保留现有 Key"
-    : "未单独配置；将复用 OCR API Key";
-  learningApiKeyInput.placeholder = learningConfigured
-    ? "••••••••（留空保持不变）"
-    : "留空时复用 OCR API Key";
+  for (const hint of document.querySelectorAll("[data-key-hint]")) {
+    const fieldName = hint.dataset.keyHint;
+    const configured = Boolean(config[`${fieldName}_CONFIGURED`]);
+    const input = form.elements.namedItem(fieldName);
+    hint.textContent = configured
+      ? "已单独配置；留空保留此 Key"
+      : "未单独配置；留空采用第一个已填写的 Key";
+    if (input) {
+      input.placeholder = configured
+        ? "••••••••（留空保持不变）"
+        : "留空时采用第一个 Key";
+    }
+  }
+}
+
+function sharedConcreteValues(type) {
+  return [...new Set(sharedValueInputs
+    .filter((input) => input.dataset.sharedType === type)
+    .map((input) => input.value.trim())
+    .filter(Boolean))];
+}
+
+function suggestionPanel(input) {
+  const field = input.closest(".field");
+  let panel = field.querySelector(".shared-suggestions");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.className = "shared-suggestions hidden";
+    panel.addEventListener("mousedown", (event) => event.preventDefault());
+    panel.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-shared-value]");
+      if (!button) return;
+      input.value = button.dataset.sharedValue;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.focus();
+    });
+    field.appendChild(panel);
+  }
+  return panel;
+}
+
+function renderSharedSuggestions(input) {
+  const panel = suggestionPanel(input);
+  const values = sharedConcreteValues(input.dataset.sharedType)
+    .filter((value) => value !== input.value.trim());
+  panel.replaceChildren();
+  if (!values.length) {
+    panel.classList.add("hidden");
+    return;
+  }
+  const label = document.createElement("span");
+  label.textContent = input.value.trim() ? "其他已填写值" : `留空默认使用第一个值 · 点击填入`;
+  panel.appendChild(label);
+  for (const value of values) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.sharedValue = value;
+    button.textContent = value;
+    button.title = `点击填入：${value}`;
+    panel.appendChild(button);
+  }
+  panel.classList.remove("hidden");
 }
 
 function setBusy(busy) {
@@ -140,7 +192,8 @@ function formatAudioTime(seconds) {
 
 function statusLabel(status) {
   return ({
-    running: "提取中", succeeded: "成功", partial: "整理失败", failed: "失败", interrupted: "已中断",
+    running: "提取中", cancelling: "正在中止", cancelled: "已中止",
+    succeeded: "成功", partial: "整理失败", failed: "失败", interrupted: "已中断",
   })[status] || status;
 }
 
@@ -178,6 +231,8 @@ function renderStudyLibrary(data) {
         <p class="library-expression"><strong>${escapeHtml(display)}${reading}</strong><span>：${meanings}</span></p>
         <button class="library-count" type="button" data-library-count="${Number(item.entry_id)}"
           aria-expanded="false" aria-label="查看 ${count} 次遇见记录">${count}</button>
+        <button class="library-delete" type="button" data-library-delete="${Number(item.entry_id)}"
+          aria-label="删除 ${escapeHtml(display)}">删除</button>
       </div>
       <div class="library-occurrences hidden" data-library-occurrences="${Number(item.entry_id)}"></div>
     </article>`;
@@ -227,11 +282,25 @@ async function toggleLibraryOccurrences(button) {
   }
 }
 
+async function deleteLibraryEntry(button) {
+  const entryId = Number(button.dataset.libraryDelete);
+  if (!entryId) return;
+  button.disabled = true;
+  try {
+    await api(`/api/library/${entryId}`, { method: "DELETE" });
+    renderStudyLibrary(await api("/api/library"));
+    notify("词库条目已删除");
+  } catch (error) {
+    button.disabled = false;
+    showError(error.message, "删除词库条目失败");
+  }
+}
+
 async function loadHistory() {
   try {
     const { items } = await api("/api/history");
     if (!items.length) {
-      historyBody.innerHTML = '<tr><td colspan="4" class="empty-state">还没有提取记录</td></tr>';
+      historyBody.innerHTML = '<tr><td colspan="5" class="empty-state">还没有提取记录</td></tr>';
       return;
     }
     historyBody.innerHTML = items.map((item) => {
@@ -248,24 +317,79 @@ async function loadHistory() {
         : "";
       const result = `${downloads}${player}`;
       const title = item.error ? `${item.message}：${item.error}` : item.message;
-      return `<tr>
+      const active = ["running", "cancelling"].includes(item.status);
+      const viewStatus = active
+        ? `<button class="history-status" type="button" data-history-status="${escapeHtml(item.job_id)}">查看状态</button>`
+        : "";
+      const deleteLabel = active ? "中止并删除" : "删除";
+      return `<tr${active ? ` class="history-active" data-history-status="${escapeHtml(item.job_id)}"` : ""}>
         <td>${formatTime(item.started_at)}</td>
-        <td class="video-cell" title="${escapeHtml(item.source_url)}">${escapeHtml(item.source_url)}</td>
+        <td class="video-cell" title="${escapeHtml(item.source_url)}">${escapeHtml(item.video_title || item.result_name || item.source_url)}</td>
         <td><span class="status-pill status-${escapeHtml(item.status)}" title="${escapeHtml(title)}">${statusLabel(item.status)}</span></td>
         <td>${result}</td>
+        <td><div class="history-row-actions">${viewStatus}<button class="history-delete" type="button" data-history-delete="${escapeHtml(item.job_id)}"${active ? ' data-force-stop="true"' : ""}>${deleteLabel}</button></div></td>
       </tr>`;
     }).join("");
   } catch (error) { notify(`历史加载失败：${error.message}`); }
+}
+
+async function viewHistoryJob(jobId) {
+  if (!jobId) return;
+  activeJobId = jobId;
+  setBusy(true);
+  await pollJob(jobId);
+  jobPanel.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function deleteHistoryEntry(button) {
+  const jobId = button.dataset.historyDelete;
+  if (!jobId) return;
+  if (button.dataset.forceStop === "true" && !window.confirm(
+    "确定立即停止并删除这个任务吗？\n\n后台提取进程会被终止，本次 URL 已产生的媒体、帧、字幕、检查点和输出都会删除。",
+  )) return;
+  button.disabled = true;
+  try {
+    await api(`/api/history/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+    playerAudio.pause();
+    playerPanel.classList.add("hidden");
+    await loadHistory();
+    notify("提取记录和关联文件已删除；单词库保持不变");
+  } catch (error) {
+    button.disabled = false;
+    showError(error.message, "删除提取记录失败");
+  }
+}
+
+async function clearHistory() {
+  clearHistoryButton.disabled = true;
+  try {
+    await api("/api/history", { method: "DELETE" });
+    playerAudio.pause();
+    playerPanel.classList.add("hidden");
+    jobPanel.classList.add("hidden");
+    await loadHistory();
+    notify("提取历史已全部清空；单词库及来源句已保留");
+  } catch (error) {
+    showError(error.message, "清空提取历史失败");
+  } finally {
+    clearHistoryButton.disabled = false;
+  }
 }
 
 function renderJob(job) {
   jobPanel.classList.remove("hidden");
   jobPanel.classList.toggle("done", job.status === "succeeded");
   jobPanel.classList.toggle(
-    "failed", ["partial", "failed", "interrupted"].includes(job.status),
+    "failed", ["partial", "failed", "interrupted", "cancelled"].includes(job.status),
   );
   jobStatus.textContent = job.message || "正在处理…";
   jobUrl.textContent = job.source_url || "";
+  const canCancel = ["running", "cancelling"].includes(job.status);
+  cancelJobButton.classList.toggle("hidden", !canCancel);
+  cancelJobButton.disabled = job.status === "cancelling";
+  cancelJobButton.textContent = job.status === "cancelling"
+    ? "正在中止并清理…"
+    : "中止并删除本次数据";
   const files = Array.isArray(job.results) && job.results.length
     ? job.results
     : (job.download_url ? [{
@@ -291,13 +415,18 @@ async function pollJob(jobId) {
   try {
     const job = await api(`/api/jobs/${jobId}`);
     renderJob(job);
-    if (job.status === "running") {
+    if (["running", "cancelling"].includes(job.status)) {
       pollingTimer = window.setTimeout(() => pollJob(jobId), 1400);
       return;
     }
     stopPolling();
     setBusy(false);
     await loadHistory();
+    if (job.status === "cancelled") {
+      activeJobId = "";
+      notify("处理已中止，本次 URL 的所有已处理数据已删除");
+      return;
+    }
     if (["partial", "failed", "interrupted"].includes(job.status)) {
       const title = job.status === "partial" ? "整理版生成失败" : "字幕提取失败";
       showError(job.error || job.message || "未知错误", title);
@@ -305,10 +434,41 @@ async function pollJob(jobId) {
       notify("字幕提取完成");
       if (job.player_url) openPlayer(job.player_url);
     }
+    activeJobId = "";
   } catch (error) {
     stopPolling();
     setBusy(false);
     showError(error.message);
+  }
+}
+
+async function cancelActiveJob() {
+  if (!activeJobId) return;
+  const confirmed = window.confirm(
+    "确定中止当前 URL 的处理吗？\n\n本次 URL 已下载的媒体、帧、字幕、检查点、输出文件和历史记录都会删除，个人单词库保持不变。",
+  );
+  if (!confirmed) return;
+  stopPolling();
+  cancelJobButton.disabled = true;
+  cancelJobButton.textContent = "正在中止并清理…";
+  try {
+    const job = await api(`/api/jobs/${encodeURIComponent(activeJobId)}`, {
+      method: "DELETE",
+    });
+    renderJob(job);
+    if (job.status === "cancelling") {
+      pollingTimer = window.setTimeout(() => pollJob(activeJobId), 700);
+    } else {
+      setBusy(false);
+      activeJobId = "";
+      await loadHistory();
+      notify("处理已中止，本次 URL 的所有已处理数据已删除");
+    }
+  } catch (error) {
+    cancelJobButton.disabled = false;
+    cancelJobButton.textContent = "中止并删除本次数据";
+    showError(error.message, "中止处理失败");
+    if (activeJobId) pollingTimer = window.setTimeout(() => pollJob(activeJobId), 1400);
   }
 }
 
@@ -320,6 +480,7 @@ async function openPlayer(url) {
     activeAnalysisUrl = data.analysis_url || `${url.replace(/\/$/, "")}/analysis`;
     activeLibraryUrl = data.library_url || `${url.replace(/\/$/, "")}/library`;
     activeResegmentUrl = data.resegment_url || `${url.replace(/\/$/, "")}/resegment`;
+    activeSentenceDeleteUrl = data.sentence_delete_url || `${url.replace(/\/$/, "")}/sentences`;
     clearBoundarySelection();
     setSentenceLoop(false);
     playerTitle.textContent = data.title || "字幕音频播放器";
@@ -346,6 +507,8 @@ function renderPlayerSentences() {
         </button>
         <div class="sentence-actions">
           <button class="analyze-button" type="button" data-analysis-index="${index}">分析</button>
+          <button class="sentence-delete" type="button" data-sentence-delete="${index}"
+            aria-label="删除这句字幕">删除</button>
         </div>
       </li>`).join("");
   if (activeSentenceIndex >= playerSentences.length) activeSentenceIndex = -1;
@@ -431,18 +594,48 @@ async function saveBoundaryEdit() {
     activeAnalysisUrl = data.analysis_url || activeAnalysisUrl;
     activeLibraryUrl = data.library_url || activeLibraryUrl;
     activeResegmentUrl = data.resegment_url || activeResegmentUrl;
+    activeSentenceDeleteUrl = data.sentence_delete_url || activeSentenceDeleteUrl;
     activeSentenceIndex = -1;
     boundaryDialog.close();
     clearBoundarySelection();
     renderPlayerSentences();
-    playerSummary.textContent = `${playerSentences.length} 句话 · 手动断句已保存并重新对齐音频`;
-    notify("断句修改已保存，音频时间已重新对齐");
+    playerSummary.textContent = `${playerSentences.length} 句话 · 字幕与断句已保存并重新对齐音频`;
+    notify("字幕与断句修改已保存，音频时间已重新对齐");
     await loadHistory();
   } catch (error) {
-    showError(error.message, "断句修改失败");
+    showError(error.message, "字幕修改失败");
   } finally {
     saveBoundaryEditButton.disabled = false;
     saveBoundaryEditButton.textContent = "保存并重新对齐音频";
+  }
+}
+
+async function deletePlayerSentence(index, button) {
+  const sentence = playerSentences[index];
+  if (!sentence || !activeSentenceDeleteUrl) return;
+  button.disabled = true;
+  button.textContent = "删除中…";
+  try {
+    const data = await api(
+      `${activeSentenceDeleteUrl}/${encodeURIComponent(sentence.sentence_id)}`,
+      { method: "DELETE" },
+    );
+    playerAudio.pause();
+    playerSentences = Array.isArray(data.sentences) ? data.sentences : [];
+    activeAnalysisUrl = data.analysis_url || activeAnalysisUrl;
+    activeLibraryUrl = data.library_url || activeLibraryUrl;
+    activeResegmentUrl = data.resegment_url || activeResegmentUrl;
+    activeSentenceDeleteUrl = data.sentence_delete_url || activeSentenceDeleteUrl;
+    activeSentenceIndex = -1;
+    clearBoundarySelection();
+    renderPlayerSentences();
+    playerSummary.textContent = `${playerSentences.length} 句话 · 已删除不存在的字幕句，单词库不受影响`;
+    notify("该句字幕已删除；已有单词库内容仍保留");
+    await loadHistory();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "删除";
+    showError(error.message, "删除单句失败");
   }
 }
 
@@ -701,6 +894,7 @@ form.addEventListener("submit", async (event) => {
   jobResult.classList.add("hidden");
   try {
     const job = await api("/api/jobs", { method: "POST", body: JSON.stringify(formValues()) });
+    activeJobId = job.job_id;
     renderJob(job);
     pollJob(job.job_id);
   } catch (error) {
@@ -708,21 +902,32 @@ form.addEventListener("submit", async (event) => {
     showError(error.message);
   }
 });
+cancelJobButton.addEventListener("click", cancelActiveJob);
 
-document.querySelector("#toggle-key").addEventListener("click", (event) => {
-  const reveal = apiKeyInput.type === "password";
-  apiKeyInput.type = reveal ? "text" : "password";
-  event.currentTarget.textContent = reveal ? "隐藏" : "显示";
-});
-document.querySelector("#toggle-learning-key").addEventListener("click", (event) => {
-  const reveal = learningApiKeyInput.type === "password";
-  learningApiKeyInput.type = reveal ? "text" : "password";
-  event.currentTarget.textContent = reveal ? "隐藏" : "显示";
-});
+for (const button of document.querySelectorAll("[data-key-toggle]")) {
+  button.addEventListener("click", () => {
+    const input = document.getElementById(button.dataset.keyToggle);
+    const reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    button.textContent = reveal ? "隐藏" : "显示";
+  });
+}
+for (const input of sharedValueInputs) {
+  input.addEventListener("focus", () => renderSharedSuggestions(input));
+  input.addEventListener("input", () => renderSharedSuggestions(input));
+  input.addEventListener("blur", () => {
+    window.setTimeout(() => suggestionPanel(input).classList.add("hidden"), 120);
+  });
+}
 document.querySelector("#close-error").addEventListener("click", () => errorDialog.close());
 document.querySelector("#open-library").addEventListener("click", openStudyLibrary);
 document.querySelector("#close-library").addEventListener("click", () => libraryDialog.close());
 libraryContent.addEventListener("click", (event) => {
+  const deleteButton = event.target.closest("[data-library-delete]");
+  if (deleteButton) {
+    deleteLibraryEntry(deleteButton);
+    return;
+  }
   const button = event.target.closest("[data-library-count]");
   if (button) toggleLibraryOccurrences(button);
 });
@@ -747,11 +952,28 @@ reanalyzeSentence.addEventListener("click", () => {
   openSentenceAnalysis(analysisSentenceIndex, button, true);
 });
 document.querySelector("#refresh-history").addEventListener("click", loadHistory);
+clearHistoryButton.addEventListener("click", clearHistory);
+historyBody.addEventListener("click", (event) => {
+  const deleteButton = event.target.closest("[data-history-delete]");
+  if (deleteButton) {
+    deleteHistoryEntry(deleteButton);
+    return;
+  }
+  const statusTarget = event.target.closest("[data-history-status]");
+  if (statusTarget) {
+    viewHistoryJob(statusTarget.dataset.historyStatus);
+  }
+});
 document.querySelector("#close-player").addEventListener("click", () => {
   playerAudio.pause();
   playerPanel.classList.add("hidden");
 });
 sentenceList.addEventListener("click", (event) => {
+  const sentenceDeleteButton = event.target.closest("[data-sentence-delete]");
+  if (sentenceDeleteButton) {
+    deletePlayerSentence(Number(sentenceDeleteButton.dataset.sentenceDelete), sentenceDeleteButton);
+    return;
+  }
   const analysisButton = event.target.closest("[data-analysis-index]");
   if (analysisButton) {
     openSentenceAnalysis(Number(analysisButton.dataset.analysisIndex), analysisButton);
@@ -773,7 +995,7 @@ sentenceList.addEventListener("click", (event) => {
   }
 });
 sentenceList.addEventListener("pointerdown", (event) => {
-  if (event.button !== 0 || event.target.closest("[data-analysis-index]")) return;
+  if (event.button !== 0 || event.target.closest("[data-analysis-index], [data-sentence-delete]")) return;
   const row = event.target.closest("[data-sentence-index]");
   if (!row) return;
   window.clearTimeout(boundaryLongPressTimer);

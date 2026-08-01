@@ -11,6 +11,15 @@ def test_configures_default_chrome_profile() -> None:
     assert options["cookiesfrombrowser"] == ("chrome", None, None, None)
 
 
+def test_configures_resumable_network_retries() -> None:
+    options = YouTubeDownloader()._base_options()
+    assert options["socket_timeout"] == 60
+    assert options["retries"] == 12
+    assert options["fragment_retries"] == 12
+    assert options["continuedl"] is True
+    assert options["nopart"] is False
+
+
 def test_selects_matching_language_before_mismatched_manual_track() -> None:
     selected = YouTubeDownloader._select_caption(
         {

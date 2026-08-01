@@ -347,6 +347,16 @@ class StudyLibrary:
             "encounters": encounters,
         }
 
+    def delete_entry(self, entry_id: int) -> bool:
+        """Delete one library entry and its forms, meanings, and saved encounters."""
+
+        if entry_id < 1:
+            raise ValueError("词库条目 ID 无效")
+        with self._write_lock, self._connect() as connection:
+            cursor = connection.execute("DELETE FROM learning_entries WHERE id = ?", (entry_id,))
+            connection.commit()
+            return cursor.rowcount > 0
+
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock, self._connect() as connection:

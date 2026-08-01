@@ -51,7 +51,7 @@ def test_manual_resegmentation_moves_boundary_and_preserves_audio_timeline() -> 
     assert updated.sentences[1].source_segment_ids == ["seg2", "seg3"]
 
 
-def test_manual_resegmentation_rejects_text_changes() -> None:
+def test_manual_resegmentation_accepts_text_changes_and_preserves_audio_span() -> None:
     document = OrganizedSubtitleDocument(
         source_markdown="sample.md",
         sentences=[
@@ -60,9 +60,25 @@ def test_manual_resegmentation_rejects_text_changes() -> None:
             )
         ],
     )
-    try:
-        apply_manual_resegmentation(document, ["s000001"], "字幕でした。")
-    except ValueError as exc:
-        assert "不能修改字幕文字" in str(exc)
-    else:
-        raise AssertionError("changing subtitle characters must be rejected")
+    updated = apply_manual_resegmentation(document, ["s000001"], "字幕でした。")
+    assert updated.sentences[0].text == "字幕でした。"
+    assert updated.sentences[0].start_ms == 0
+    assert updated.sentences[0].end_ms == 1000
+
+
+def test_delete_sentence_reindexes_without_touching_other_content() -> None:
+    from submd.editing import delete_organized_sentence
+
+    document = OrganizedSubtitleDocument(
+        source_markdown="sample.md",
+        sentences=[
+            OrganizedSentence(sentence_id="s000001", text="本物。", start_ms=0, end_ms=900),
+            OrganizedSentence(sentence_id="s000002", text="幻覚。", start_ms=900, end_ms=1800),
+            OrganizedSentence(sentence_id="s000003", text="続き。", start_ms=1800, end_ms=2700),
+        ],
+    )
+    updated = delete_organized_sentence(document, "s000002")
+    assert [(item.sentence_id, item.text) for item in updated.sentences] == [
+        ("s000001", "本物。"),
+        ("s000002", "続き。"),
+    ]

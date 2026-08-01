@@ -99,13 +99,13 @@ def extract(
             help="请求云厂商启用 JSON 输出；不兼容时可关闭。",
         ),
     ] = True,
-    sample_fps: Annotated[float, typer.Option(help="FFmpeg 每秒采样帧数。")] = 3.0,
+    sample_fps: Annotated[float, typer.Option(help="FFmpeg 每秒采样帧数。")] = 10.0,
     change_threshold: Annotated[
-        float, typer.Option(help="画面变化筛选阈值；0 表示 OCR 所有采样帧。")
+        float, typer.Option(help="兼容旧配置保留；字幕帧现在会按文字轮廓自动去重。")
     ] = 0.012,
     max_ocr_interval: Annotated[
-        float, typer.Option(help="画面不变时强制再次 OCR 的最大间隔秒数。")
-    ] = 2.0,
+        float, typer.Option(help="YouTube 字幕覆盖区间内的本地安全探测间隔。")
+    ] = 0.8,
     min_confidence: Annotated[
         float, typer.Option(help="低于此模型自报置信度时标记人工复核。")
     ] = 0.55,

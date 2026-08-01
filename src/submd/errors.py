@@ -10,6 +10,10 @@ class DownloadError(SubmdError):
     """Video metadata or media could not be downloaded."""
 
 
+class ExtractionCancelled(SubmdError):
+    """The current URL processing job was cancelled by the user."""
+
+
 class MediaError(SubmdError):
     """FFmpeg or OpenCV media processing failed."""
 

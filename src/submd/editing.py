@@ -67,13 +67,55 @@ def apply_manual_resegmentation(
         raise ValueError("只能连续选择前后相邻的句子")
     selected = document.sentences[indexes[0] : indexes[-1] + 1]
     source_text = "".join(sentence.text for sentence in selected)
-    if _content_key(source_text) != _content_key(edited_text):
-        raise ValueError("这里只能增删或移动句号，不能修改字幕文字")
     new_texts = preview_manual_sentences(edited_text)
     if not new_texts:
         raise ValueError("修改后没有可用的句子")
 
-    timings = _source_character_timings(selected, source_segments or [])
+    if _content_key(source_text) == _content_key(edited_text):
+        replacements = _replacements_from_character_timings(
+            selected, new_texts, source_segments or []
+        )
+    else:
+        replacements = _proportional_replacements(selected, new_texts)
+
+    combined = [
+        *document.sentences[: indexes[0]],
+        *replacements,
+        *document.sentences[indexes[-1] + 1 :],
+    ]
+    reindexed = [
+        sentence.model_copy(update={"sentence_id": f"s{index:06d}"})
+        for index, sentence in enumerate(combined, 1)
+    ]
+    return document.model_copy(update={"sentences": reindexed})
+
+
+def delete_organized_sentence(
+    document: OrganizedSubtitleDocument, sentence_id: str
+) -> OrganizedSubtitleDocument:
+    """Delete one player sentence without changing the learning library."""
+    if not sentence_id:
+        raise ValueError("句子 ID 为空")
+    if not any(sentence.sentence_id == sentence_id for sentence in document.sentences):
+        raise ValueError("该句子不属于当前视频")
+    remaining = [
+        sentence
+        for sentence in document.sentences
+        if sentence.sentence_id != sentence_id
+    ]
+    reindexed = [
+        sentence.model_copy(update={"sentence_id": f"s{index:06d}"})
+        for index, sentence in enumerate(remaining, 1)
+    ]
+    return document.model_copy(update={"sentences": reindexed})
+
+
+def _replacements_from_character_timings(
+    selected: list[OrganizedSentence],
+    new_texts: list[str],
+    source_segments: list[SubtitleSegment],
+) -> list[OrganizedSentence]:
+    timings = _source_character_timings(selected, source_segments)
     if timings is None:
         timings = _character_timings(selected)
     cursor = 0
@@ -104,17 +146,47 @@ def apply_manual_resegmentation(
         cursor += length
     if cursor != len(timings):
         raise ValueError("修改后的句子未覆盖全部原始字幕")
+    return replacements
 
-    combined = [
-        *document.sentences[: indexes[0]],
-        *replacements,
-        *document.sentences[indexes[-1] + 1 :],
-    ]
-    reindexed = [
-        sentence.model_copy(update={"sentence_id": f"s{index:06d}"})
-        for index, sentence in enumerate(combined, 1)
-    ]
-    return document.model_copy(update={"sentences": reindexed})
+
+def _proportional_replacements(
+    selected: list[OrganizedSentence], new_texts: list[str]
+) -> list[OrganizedSentence]:
+    """Keep the selected audio span when the user also corrects subtitle characters."""
+    start_ms = selected[0].start_ms
+    end_ms = max(start_ms, selected[-1].end_ms)
+    duration = max(1, end_ms - start_ms)
+    weights = [max(1, len(_content_key(text))) for text in new_texts]
+    total_weight = sum(weights)
+    source_unit_ids = list(
+        dict.fromkeys(source_id for sentence in selected for source_id in sentence.source_unit_ids)
+    )
+    source_segment_ids = list(
+        dict.fromkeys(
+            source_id for sentence in selected for source_id in sentence.source_segment_ids
+        )
+    )
+    replacements: list[OrganizedSentence] = []
+    consumed = 0
+    for index, (text, weight) in enumerate(zip(new_texts, weights, strict=True)):
+        item_start = start_ms + round(duration * consumed / total_weight)
+        consumed += weight
+        item_end = (
+            end_ms
+            if index == len(new_texts) - 1
+            else start_ms + round(duration * consumed / total_weight)
+        )
+        replacements.append(
+            OrganizedSentence(
+                sentence_id="pending",
+                text=text,
+                start_ms=item_start,
+                end_ms=max(item_start, item_end),
+                source_unit_ids=source_unit_ids,
+                source_segment_ids=source_segment_ids,
+            )
+        )
+    return replacements
 
 
 def _character_timings(sentences: list[OrganizedSentence]) -> list[_CharacterTiming]:

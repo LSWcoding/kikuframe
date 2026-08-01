@@ -16,7 +16,18 @@ class _ActiveSegment:
 
 
 def _similar(left: str, right: str, threshold: float) -> bool:
-    return ratio(normalize_text(left), normalize_text(right)) >= threshold
+    normalized_left = normalize_text(left)
+    normalized_right = normalize_text(right)
+    if ratio(normalized_left, normalized_right) >= threshold:
+        return True
+    compact_left = normalized_left.replace("\n", "").replace(" ", "")
+    compact_right = normalized_right.replace("\n", "").replace(" ", "")
+    shorter, longer = sorted((compact_left, compact_right), key=len)
+    return (
+        len(shorter) >= 4
+        and shorter in longer
+        and len(shorter) / max(1, len(longer)) >= 0.30
+    )
 
 
 def _representative(observations: list[OcrObservation]) -> tuple[str, float, list[str]]:
@@ -30,12 +41,34 @@ def _representative(observations: list[OcrObservation]) -> tuple[str, float, lis
         confidences.append(observation.confidence)
     ranked = sorted(
         grouped_scores,
-        key=lambda text: (grouped_counts[text], grouped_scores[text], len(text)),
+        key=lambda text: (
+            sum(
+                grouped_counts[other]
+                for other in grouped_scores
+                if _similar(text, other, 72.0)
+            ),
+            len(text.replace("\n", "").replace(" ", "")),
+            grouped_counts[text],
+            grouped_scores[text],
+        ),
         reverse=True,
     )
     representative = ranked[0]
     alternatives = [text for text in ranked[1:4] if text != representative]
     return representative, sum(confidences) / len(confidences), alternatives
+
+
+def _overlap_join(left: str, right: str) -> str | None:
+    clean_left = normalize_text(left).replace("\n", "")
+    clean_right = normalize_text(right).replace("\n", "")
+    maximum = min(len(clean_left), len(clean_right))
+    for size in range(maximum, 3, -1):
+        if (
+            clean_left[-size:] == clean_right[:size]
+            and size / max(1, min(len(clean_left), len(clean_right))) >= 0.30
+        ):
+            return clean_left + clean_right[size:]
+    return None
 
 
 def build_segments(
@@ -64,7 +97,7 @@ def build_segments(
                 confidence=confidence,
                 observation_count=len(active.observations),
                 alternatives=alternatives,
-                needs_review=confidence < review_confidence or len(active.observations) < 2,
+                needs_review=confidence < review_confidence,
             )
         )
         active = None
@@ -102,11 +135,40 @@ def build_segments(
             previous.end_ms = segment.end_ms
             previous.observation_count = count
             previous.needs_review = (
-                previous.confidence < review_confidence or previous.observation_count < 2
+                previous.confidence < review_confidence
             )
             previous.alternatives = list(
                 dict.fromkeys([*previous.alternatives, *segment.alternatives])
             )[:3]
+            if len(normalize_text(segment.text)) > len(normalize_text(previous.text)):
+                previous.text = segment.text
         else:
-            merged.append(segment)
+            joined = (
+                _overlap_join(merged[-1].text, segment.text)
+                if merged
+                and segment.start_ms - merged[-1].end_ms <= sample_interval_ms
+                else None
+            )
+            if joined is None:
+                merged.append(segment)
+                continue
+            previous = merged[-1]
+            count = previous.observation_count + segment.observation_count
+            previous.text = joined
+            previous.end_ms = segment.end_ms
+            previous.confidence = (
+                previous.confidence * previous.observation_count
+                + segment.confidence * segment.observation_count
+            ) / count
+            previous.observation_count = count
+            previous.needs_review = previous.confidence < review_confidence
+            previous.alternatives = list(
+                dict.fromkeys(
+                    [
+                        *previous.alternatives,
+                        segment.text,
+                        *segment.alternatives,
+                    ]
+                )
+            )[:3]
     return merged

@@ -20,6 +20,7 @@ def test_cloud_ocr_sends_images_and_parses_fenced_json(tmp_path: Path) -> None:
         make_frame(tmp_path / "one.jpg", 1),
         make_frame(tmp_path / "two.jpg", 2),
     ]
+    frames[0].reading_reference = ["メリットの1つ目は接客がないところ"]
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://vendor.example/v1/chat/completions"
@@ -28,13 +29,20 @@ def test_cloud_ocr_sends_images_and_parses_fenced_json(tmp_path: Path) -> None:
         assert body["model"] == "vision-ocr"
         assert body["response_format"] == {"type": "json_object"}
         images = [part for part in body["messages"][1]["content"] if part["type"] == "image_url"]
+        text_parts = [
+            part["text"]
+            for part in body["messages"][1]["content"]
+            if part["type"] == "text"
+        ]
         assert len(images) == 2
+        assert all("接客がないところ" not in value for value in text_parts)
+        assert all("youtube_reading_reference" not in value for value in text_parts)
         assert all(
             item["image_url"]["url"].startswith("data:image/jpeg;base64,") for item in images
         )
         content = """```json
         {"frames":[
-          {"frame_id":"000001","text":"  第一行  ","confidence":0.94},
+          {"frame_id":"000001","text":"  第一行  ","confidence":0.94,"line_count":1},
           {"frame_id":"000002","text":"","confidence":0.99}
         ]}
         ```"""
@@ -54,6 +62,7 @@ def test_cloud_ocr_sends_images_and_parses_fenced_json(tmp_path: Path) -> None:
     result = engine.recognize_batch(frames)
 
     assert [item.text for item in result.frames] == ["第一行", ""]
+    assert [item.line_count for item in result.frames] == [1, 0]
     assert result.request_id == "req-test"
     assert result.usage["prompt_tokens"] == 123
 

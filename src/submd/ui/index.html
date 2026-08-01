@@ -38,75 +38,157 @@
               placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" />
           </label>
 
-          <div class="field-grid">
-            <label class="field">
-              <span>OCR API Base URL <b>必填</b></span>
-              <input name="SUBMD_OCR_BASE_URL" type="url" required
-                placeholder="https://vendor.example/v1" autocomplete="off" />
-            </label>
-            <label class="field">
-              <span>视觉模型名称 <b>必填</b></span>
-              <input name="SUBMD_OCR_MODEL" type="text" required
-                placeholder="provider/vision-model" autocomplete="off" />
-            </label>
-            <label class="field">
-              <span>API Key <b>必填</b></span>
-              <div class="password-wrap">
-                <input id="api-key" name="SUBMD_OCR_API_KEY" type="password"
-                  placeholder="输入后保存在本机" autocomplete="new-password" />
-                <button type="button" id="toggle-key" class="icon-button" aria-label="显示 API Key">显示</button>
-              </div>
-              <small id="key-hint">尚未配置</small>
-            </label>
-            <label class="field">
-              <span>浏览器 Cookie</span>
-              <input name="SUBMD_YOUTUBE_COOKIES_FROM_BROWSER" type="text"
-                placeholder="chrome" autocomplete="off" />
-              <small>YouTube 要求验证时使用，通常填写 chrome</small>
-            </label>
+          <label class="field field-wide">
+            <span>浏览器 Cookie</span>
+            <input name="SUBMD_YOUTUBE_COOKIES_FROM_BROWSER" type="text"
+              placeholder="chrome" autocomplete="off" />
+            <small>YouTube 要求验证时使用，通常填写 chrome</small>
+          </label>
+
+          <div class="model-config-heading">
+            <div>
+              <p class="section-index">FIVE INDEPENDENT MODEL ROLES</p>
+              <h3>五个独立模型配置</h3>
+            </div>
+            <p>地址、模型名或 Key 留空时，分别采用五组中从上到下第一个已填写的具体值。</p>
           </div>
 
-          <details class="advanced">
-            <summary>整理版字幕模型（可选）</summary>
-            <div class="field-grid advanced-grid">
+          <div class="model-config-grid">
+            <fieldset class="model-card" data-model-role="ocr">
+              <legend><span>01</span>视觉 OCR</legend>
+              <p>读取视频画面中的烧录字幕。</p>
               <label class="field">
-                <span>文本模型 API Base URL</span>
-                <input name="SUBMD_TEXT_BASE_URL" type="url"
-                  placeholder="留空时复用 OCR 地址" autocomplete="off" />
+                <span>API Base URL</span>
+                <input name="SUBMD_OCR_BASE_URL" type="url" data-shared-type="base-url"
+                  placeholder="https://vendor.example/v1" autocomplete="off" />
               </label>
               <label class="field">
-                <span>文本模型名称</span>
-                <input name="SUBMD_TEXT_MODEL" type="text"
-                  placeholder="留空时复用视觉模型" autocomplete="off" />
+                <span>模型名称</span>
+                <input name="SUBMD_OCR_MODEL" type="text" data-shared-type="model"
+                  placeholder="provider/vision-model" autocomplete="off" />
               </label>
-            </div>
-          </details>
+              <label class="field">
+                <span>API Key</span>
+                <div class="password-wrap">
+                  <input id="api-key" name="SUBMD_OCR_API_KEY" type="password"
+                    data-shared-type="api-key" placeholder="输入后保存在本机"
+                    autocomplete="new-password" />
+                  <button type="button" class="icon-button" data-key-toggle="api-key"
+                    aria-label="显示视觉 OCR API Key">显示</button>
+                </div>
+                <small id="key-hint" data-key-hint="SUBMD_OCR_API_KEY">尚未配置</small>
+              </label>
+            </fieldset>
 
-          <details class="advanced">
-            <summary>语言学习模型（可选，留空时复用整理模型）</summary>
-            <div class="field-grid advanced-grid">
+            <fieldset class="model-card" data-model-role="review">
+              <legend><span>02</span>冲突复核视觉</legend>
+              <p>仅重新读取有争议的来源帧。</p>
               <label class="field">
-                <span>语言学习 API Base URL</span>
-                <input name="SUBMD_LEARNING_BASE_URL" type="url"
-                  placeholder="留空时复用整理模型或 OCR 地址" autocomplete="off" />
+                <span>API Base URL</span>
+                <input name="SUBMD_OCR_REVIEW_BASE_URL" type="url"
+                  data-shared-type="base-url" placeholder="留空时采用第一个地址"
+                  autocomplete="off" />
               </label>
               <label class="field">
-                <span>语言学习模型名称</span>
-                <input name="SUBMD_LEARNING_MODEL" type="text"
-                  placeholder="留空时复用整理模型或视觉模型" autocomplete="off" />
+                <span>模型名称</span>
+                <input name="SUBMD_OCR_REVIEW_MODEL" type="text" data-shared-type="model"
+                  placeholder="留空时采用第一个模型名" autocomplete="off" />
               </label>
               <label class="field">
-                <span>语言学习 API Key</span>
+                <span>API Key</span>
+                <div class="password-wrap">
+                  <input id="review-api-key" name="SUBMD_OCR_REVIEW_API_KEY" type="password"
+                    data-shared-type="api-key" placeholder="留空时采用第一个 Key"
+                    autocomplete="new-password" />
+                  <button type="button" class="icon-button" data-key-toggle="review-api-key"
+                    aria-label="显示冲突复核 API Key">显示</button>
+                </div>
+                <small data-key-hint="SUBMD_OCR_REVIEW_API_KEY">未单独配置</small>
+              </label>
+            </fieldset>
+
+            <fieldset class="model-card" data-model-role="text">
+              <legend><span>03</span>字幕取舍</legend>
+              <p>按时间窗比较 YouTube 字幕与 OCR 文字。</p>
+              <label class="field">
+                <span>API Base URL</span>
+                <input name="SUBMD_TEXT_BASE_URL" type="url" data-shared-type="base-url"
+                  placeholder="留空时采用第一个地址" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>模型名称</span>
+                <input name="SUBMD_TEXT_MODEL" type="text" data-shared-type="model"
+                  placeholder="留空时采用第一个模型名" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>API Key</span>
+                <div class="password-wrap">
+                  <input id="text-api-key" name="SUBMD_TEXT_API_KEY" type="password"
+                    data-shared-type="api-key" placeholder="留空时采用第一个 Key"
+                    autocomplete="new-password" />
+                  <button type="button" class="icon-button" data-key-toggle="text-api-key"
+                    aria-label="显示字幕取舍 API Key">显示</button>
+                </div>
+                <small data-key-hint="SUBMD_TEXT_API_KEY">未单独配置</small>
+              </label>
+            </fieldset>
+
+            <fieldset class="model-card" data-model-role="boundary">
+              <legend><span>04</span>语义分句</legend>
+              <p>只决定字符边界，不改写已经确定的字幕。</p>
+              <label class="field">
+                <span>API Base URL</span>
+                <input name="SUBMD_BOUNDARY_BASE_URL" type="url" data-shared-type="base-url"
+                  placeholder="留空时采用第一个地址" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>模型名称</span>
+                <input name="SUBMD_BOUNDARY_MODEL" type="text" data-shared-type="model"
+                  placeholder="留空时采用第一个模型名" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>API Key</span>
+                <div class="password-wrap">
+                  <input id="boundary-api-key" name="SUBMD_BOUNDARY_API_KEY" type="password"
+                    data-shared-type="api-key" placeholder="留空时采用第一个 Key"
+                    autocomplete="new-password" />
+                  <button type="button" class="icon-button" data-key-toggle="boundary-api-key"
+                    aria-label="显示语义分句 API Key">显示</button>
+                </div>
+                <small data-key-hint="SUBMD_BOUNDARY_API_KEY">未单独配置</small>
+              </label>
+            </fieldset>
+
+            <fieldset class="model-card" data-model-role="learning">
+              <legend><span>05</span>语言学习</legend>
+              <p>生成单句翻译、词汇、读音、搭配与文法。</p>
+              <label class="field">
+                <span>API Base URL</span>
+                <input name="SUBMD_LEARNING_BASE_URL" type="url" data-shared-type="base-url"
+                  placeholder="留空时采用第一个地址" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>模型名称</span>
+                <input name="SUBMD_LEARNING_MODEL" type="text" data-shared-type="model"
+                  placeholder="留空时采用第一个模型名" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>API Key</span>
                 <div class="password-wrap">
                   <input id="learning-api-key" name="SUBMD_LEARNING_API_KEY" type="password"
-                    placeholder="留空时复用 OCR API Key" autocomplete="new-password" />
-                  <button type="button" id="toggle-learning-key" class="icon-button"
+                    data-shared-type="api-key" placeholder="留空时采用第一个 Key"
+                    autocomplete="new-password" />
+                  <button type="button" class="icon-button" data-key-toggle="learning-api-key"
                     aria-label="显示语言学习 API Key">显示</button>
                 </div>
-                <small id="learning-key-hint">未单独配置；将复用 OCR API Key</small>
+                <small id="learning-key-hint" data-key-hint="SUBMD_LEARNING_API_KEY">未单独配置</small>
               </label>
-            </div>
-          </details>
+            </fieldset>
+          </div>
+
+          <p class="model-isolation-note">
+            五个职责始终创建独立的模型配置与调用客户端；即使模型名称完全相同，也不会共用请求或输入数据。
+          </p>
 
           <div class="actions">
             <button type="button" id="save-button" class="button secondary">保存配置</button>
@@ -125,6 +207,9 @@
           <h2 id="job-status">准备开始…</h2>
           <p id="job-url" class="muted truncate"></p>
         </div>
+        <button id="cancel-job" class="button cancel-job-button hidden" type="button">
+          中止并删除本次数据
+        </button>
         <div id="job-result" class="result-link hidden">
           <span>结果文件</span>
           <div id="result-links"></div>
@@ -148,17 +233,17 @@
             <button id="next-sentence" class="button secondary" type="button">下一句</button>
             <button id="loop-sentence" class="button loop-button" type="button"
               aria-pressed="false">单句循环：关</button>
-            <button id="start-boundary-selection" class="button secondary" type="button">断句纠错</button>
+            <button id="start-boundary-selection" class="button secondary" type="button">字幕纠错</button>
           </div>
         </div>
         <div class="boundary-help">
-          长按任意句子进入断句纠错；也可先播放一句，再点“断句纠错”。之后点击另一句可连续选择前后句。
+          长按任意句子进入字幕纠错；也可先播放一句，再点“字幕纠错”。可连续选择前后句，同时修改文字和断句。
         </div>
         <div id="boundary-toolbar" class="boundary-toolbar hidden" role="status">
           <span id="boundary-selection-count">已选择 0 句</span>
           <div>
             <button id="cancel-boundary-selection" class="text-button" type="button">取消</button>
-            <button id="open-boundary-editor" class="button primary" type="button">修改断句</button>
+            <button id="open-boundary-editor" class="button primary" type="button">修改字幕与断句</button>
           </div>
         </div>
         <ol id="sentence-list" class="sentence-list" aria-label="可点击字幕"></ol>
@@ -170,15 +255,18 @@
             <p class="section-index">03</p>
             <h2 id="history-title">提取历史</h2>
           </div>
-          <button id="refresh-history" class="text-button" type="button">刷新</button>
+          <div class="history-actions">
+            <button id="refresh-history" class="text-button" type="button">刷新</button>
+            <button id="clear-history" class="text-button danger-text" type="button">全部清空</button>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
-              <tr><th>时间</th><th>视频</th><th>状态</th><th>结果</th></tr>
+              <tr><th>时间</th><th>视频</th><th>状态</th><th>结果</th><th>操作</th></tr>
             </thead>
             <tbody id="history-body">
-              <tr><td colspan="4" class="empty-state">还没有提取记录</td></tr>
+              <tr><td colspan="5" class="empty-state">还没有提取记录</td></tr>
             </tbody>
           </table>
         </div>
@@ -226,17 +314,17 @@
     <dialog id="boundary-dialog" class="boundary-dialog" aria-labelledby="boundary-title">
       <div class="analysis-header">
         <div>
-          <p class="section-index">BOUNDARY CORRECTION</p>
-          <h2 id="boundary-title">手动修改断句</h2>
+          <p class="section-index">SUBTITLE CORRECTION</p>
+          <h2 id="boundary-title">手动修改字幕与断句</h2>
         </div>
         <button id="close-boundary-dialog" class="dialog-close" type="button"
-          aria-label="关闭断句弹窗">×</button>
+          aria-label="关闭字幕纠错弹窗">×</button>
       </div>
       <div class="boundary-editor-body">
-        <p class="boundary-instruction">只需增删或移动句号“。”；每个句号就是一个新断点。字幕文字不能改动。</p>
+        <p class="boundary-instruction">可直接修正字幕文字；句号“。”或换行代表一个新断点。保存后会在原时间范围内重新对齐音频。</p>
         <textarea id="boundary-editor-text" rows="8" spellcheck="false"></textarea>
         <div class="boundary-preview-block">
-          <h3>修改后的断句</h3>
+          <h3>修改后的字幕与断句</h3>
           <ol id="boundary-preview"></ol>
         </div>
       </div>

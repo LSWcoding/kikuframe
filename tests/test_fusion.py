@@ -20,6 +20,7 @@ class ReferenceAwareEngine:
         assert targets[0]["ocr_text"] == "孤賃で働いています"
         assert targets[0]["ocr_alternatives"] == ["個人で働いています"]
         assert targets[0]["youtube_reading_reference"][0]["text"] == "個人で働いています"
+        assert targets[0]["reference_conflict"] is True
         return (
             [
                 CaptionCorrection(
@@ -91,3 +92,14 @@ def test_fusion_safety_rejects_large_deletions_and_insertions() -> None:
         "海外に行くって言ったら寂",
         "海外に行くって言ったら褒めてくれるんだろうね",
     ) is False
+
+
+def test_detects_high_context_ocr_youtube_conflict() -> None:
+    assert SubtitleFusion._reference_conflict(
+        "メリットの1つ目は挨拶がないところです。",
+        ["ですメリットの1つ目は接客がないところ"],
+    )
+    assert not SubtitleFusion._reference_conflict(
+        "焼き菓子を作っています。",
+        ["今日は工場で働いています"],
+    )

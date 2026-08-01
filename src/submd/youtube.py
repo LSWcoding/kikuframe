@@ -44,8 +44,17 @@ class YouTubeDownloader:
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 60,
+            "retries": 12,
+            "fragment_retries": 12,
+            "extractor_retries": 5,
+            "file_access_retries": 5,
+            "continuedl": True,
+            "nopart": False,
             "logger": _YtDlpLogger(self.callback),
             "js_runtimes": {"deno": {}},
+            "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
         }
         if cookies_from_browser:
             browser, separator, profile = cookies_from_browser.partition(":")
@@ -56,6 +65,17 @@ class YouTubeDownloader:
                 None,
             )
         return options
+
+    def _progress_hook(self, progress: dict[str, Any]) -> None:
+        if not self.callback:
+            return
+        percent = str(progress.get("_percent_str") or "").strip()
+        suffix = f" {percent}" if percent else ""
+        self.callback(f"下载视频…{suffix}")
+
+    def _postprocessor_hook(self, progress: dict[str, Any]) -> None:
+        if self.callback:
+            self.callback(f"整理下载媒体…{str(progress.get('status') or '')}")
 
     def inspect(self, url: str, cookies_from_browser: str | None = None) -> VideoMetadata:
         try:
@@ -85,7 +105,8 @@ class YouTubeDownloader:
                     f"best[height<={max_height}]/bestvideo+bestaudio/best"
                 ),
                 "outtmpl": str(target_dir / "source.%(ext)s"),
-                "overwrites": True,
+                "overwrites": False,
+                "http_chunk_size": 10 * 1024 * 1024,
                 "merge_output_format": "mkv",
             }
         )

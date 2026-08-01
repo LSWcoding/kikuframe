@@ -97,14 +97,15 @@ class ExtractionConfig(BaseModel):
     roi: Roi = Field(default_factory=Roi)
     language: str = "auto"
     ocr: CloudOcrConfig
-    sample_fps: float = Field(default=3.0, gt=0.0, le=30.0)
+    sample_fps: float = Field(default=10.0, gt=0.0, le=30.0)
     change_threshold: float = Field(default=0.012, ge=0.0, le=1.0)
-    max_ocr_interval: float = Field(default=2.0, gt=0.0, le=60.0)
+    max_ocr_interval: float = Field(default=0.8, gt=0.0, le=60.0)
     min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
     similarity_threshold: float = Field(default=82.0, ge=0.0, le=100.0)
     max_height: int = Field(default=720, ge=144, le=4320)
     keep_cache: bool = False
     overwrite: bool = False
+    pipeline_revision: str = "windowed-text-reconciliation-v2"
 
 
 class VideoMetadata(BaseModel):
@@ -129,12 +130,15 @@ class FrameRef(BaseModel):
     timestamp_ms: int
     path: Path
     diff_score: float = 1.0
+    reading_reference: list[str] = Field(default_factory=list)
+    visual_line_count: int = Field(default=0, ge=0)
 
 
 class CloudOcrFrameResult(BaseModel):
     frame_id: str
     text: str
     confidence: float = Field(ge=0.0, le=1.0)
+    line_count: int = Field(default=0, ge=0)
 
 
 class CloudOcrBatchResult(BaseModel):
@@ -154,13 +158,19 @@ class OcrObservation(BaseModel):
     request_id: str | None = None
     text: str
     confidence: float = Field(ge=0.0, le=1.0)
+    line_count: int = Field(default=0, ge=0)
 
 
 class SubtitleSegment(BaseModel):
     start_ms: int
     end_ms: int
     text: str
-    source: Literal["burned_ocr", "burned_ocr_corrected"] = "burned_ocr"
+    source: Literal[
+        "burned_ocr",
+        "burned_ocr_corrected",
+        "youtube_primary",
+        "screen_annotation",
+    ] = "burned_ocr"
     confidence: float = Field(ge=0.0, le=1.0)
     observation_count: int = 1
     alternatives: list[str] = Field(default_factory=list)
@@ -214,6 +224,26 @@ class CaptionCorrection(BaseModel):
     segment_id: str
     corrected_text: str = Field(min_length=1)
     reason: str = ""
+
+
+class ReconciledSpokenSegment(BaseModel):
+    cue_ids: list[str] = Field(min_length=1)
+    ocr_segment_ids: list[str] = Field(default_factory=list)
+    text: str = Field(min_length=1)
+    reason: str = ""
+    needs_visual_recheck: bool = False
+
+
+class ReconciledScreenAnnotation(BaseModel):
+    ocr_segment_ids: list[str] = Field(min_length=1)
+    text: str = Field(min_length=1)
+    reason: str = ""
+    needs_visual_recheck: bool = False
+
+
+class YoutubePrimaryReconciliation(BaseModel):
+    spoken: list[ReconciledSpokenSegment]
+    screen_annotations: list[ReconciledScreenAnnotation] = Field(default_factory=list)
 
 
 class OrganizedSentence(BaseModel):

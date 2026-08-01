@@ -51,9 +51,16 @@ def export_markdown(
         f"video_id: {json.dumps(metadata.video_id)}",
         f"source_url: {json.dumps(metadata.webpage_url, ensure_ascii=False)}",
         (
-            'subtitle_source: "burned_ocr+youtube_reading_reference"'
-            if any(segment.source == "burned_ocr_corrected" for segment in document.segments)
-            else 'subtitle_source: "burned_ocr"'
+            'subtitle_source: "youtube_primary+burned_ocr_visual_verification"'
+            if any(segment.source == "youtube_primary" for segment in document.segments)
+            else (
+                'subtitle_source: "burned_ocr+youtube_reading_reference"'
+                if any(
+                    segment.source == "burned_ocr_corrected"
+                    for segment in document.segments
+                )
+                else 'subtitle_source: "burned_ocr"'
+            )
         ),
         'ocr_backend: "cloud_vlm"',
         f"ocr_model: {json.dumps(document.config.ocr.model, ensure_ascii=False)}",
@@ -70,6 +77,8 @@ def export_markdown(
         for segment in document.segments:
             time_range = f"{format_timestamp(segment.start_ms)}–{format_timestamp(segment.end_ms)}"
             text = segment.text.replace("\n", "<br>")
+            if segment.source == "screen_annotation":
+                text = f"【画面补充】{text}"
             review = " ⚠️" if segment.needs_review else ""
             lines.append(f"- [{time_range}] {text}{review}")
     lines.append("")

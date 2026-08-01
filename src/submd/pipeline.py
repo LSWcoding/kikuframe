@@ -5,14 +5,18 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
+from submd.coverage import find_reference_coverage_windows, select_supplemental_frames
+from submd.errors import SubmdError
 from submd.exporters import export_markdown
 from submd.json_io import write_json
 from submd.media import extract_audio, extract_frames, probe_video, select_ocr_frames
 from submd.models import (
     ExtractionConfig,
     ExtractionResult,
+    FrameRef,
     OcrObservation,
     SubtitleDocument,
+    SubtitleSegment,
     YouTubeCaptionTrack,
 )
 from submd.ocr.base import OcrEngine
@@ -21,6 +25,8 @@ from submd.segments import build_segments
 from submd.youtube import YouTubeDownloader
 
 StatusCallback = Callable[[str], None]
+CancelCheck = Callable[[], bool]
+PIPELINE_REVISION = "windowed-text-reconciliation-v2"
 
 
 class BurnedSubtitlePipeline:
@@ -30,11 +36,13 @@ class BurnedSubtitlePipeline:
         ocr_engine: OcrEngine | None = None,
         api_key: str | None = None,
         status: StatusCallback | None = None,
+        cancelled: CancelCheck | None = None,
     ) -> None:
         self.status = status or (lambda _message: None)
         self.downloader = downloader or YouTubeDownloader(callback=self.status)
         self.ocr_engine = ocr_engine
         self.api_key = api_key
+        self.cancelled = cancelled or (lambda: False)
 
     def run(self, config: ExtractionConfig) -> ExtractionResult:
         self.status("读取视频信息…")
@@ -52,8 +60,23 @@ class BurnedSubtitlePipeline:
         observations_path = job_dir / "observations.json"
         api_calls_path = job_dir / "api_calls.json"
         segments_path = job_dir / "segments.json"
+        caption_path = job_dir / "youtube_captions.json"
+        reuse_checkpoints = self._ocr_checkpoint_compatible(config_path, config)
         write_json(metadata_path, metadata)
         write_json(config_path, config)
+
+        reference_track: YouTubeCaptionTrack | None = None
+        if hasattr(self.downloader, "fetch_caption_track"):
+            self.status("预读取 YouTube 字幕时间，防止视觉筛帧漏掉字幕变化…")
+            try:
+                reference_track = self.downloader.fetch_caption_track(
+                    config.source_url,
+                    caption_path,
+                    language_hint=config.language,
+                    cookies_from_browser=config.cookies_from_browser,
+                )
+            except SubmdError as exc:
+                self.status(f"YouTube 字幕时间不可用，继续使用视觉变化与安全采样：{exc}")
 
         cached_videos = sorted(
             path
@@ -71,7 +94,7 @@ class BurnedSubtitlePipeline:
                 config.max_height,
                 cookies_from_browser=config.cookies_from_browser,
             )
-        media_info = probe_video(video_path)
+        media_info = probe_video(video_path, cancelled=self.cancelled)
         metadata.duration_ms = media_info.duration_ms
         metadata.width = media_info.width
         metadata.height = media_info.height
@@ -81,9 +104,27 @@ class BurnedSubtitlePipeline:
             f"FFmpeg 抽帧：{media_info.width}×{media_info.height}，"
             f"{config.sample_fps:g} FPS，ROI={config.roi.model_dump()}"
         )
-        frames = extract_frames(video_path, frames_dir, config.roi, config.sample_fps)
+        frames = extract_frames(
+            video_path,
+            frames_dir,
+            config.roi,
+            config.sample_fps,
+            cancelled=self.cancelled,
+        )
         shutil.copy2(frames[0].path, preview_dir / "roi-first-frame.jpg")
-        selected = select_ocr_frames(frames, config.change_threshold, config.max_ocr_interval)
+        selected = select_ocr_frames(
+            frames,
+            config.change_threshold,
+            config.max_ocr_interval,
+            hint_timestamps_ms=(
+                [cue.start_ms for cue in reference_track.cues] if reference_track else None
+            ),
+            coverage_windows_ms=(
+                [(cue.start_ms, cue.end_ms) for cue in reference_track.cues]
+                if reference_track
+                else None
+            ),
+        )
         self.status(f"抽取 {len(frames)} 帧，选择 {len(selected)} 帧执行云端 OCR")
 
         engine = self.ocr_engine or OpenAICompatibleOcrEngine(
@@ -91,69 +132,22 @@ class BurnedSubtitlePipeline:
             api_key=self.api_key or "",
             language_hint=config.language,
         )
-        batches = [
-            selected[index : index + config.ocr.batch_size]
-            for index in range(0, len(selected), config.ocr.batch_size)
-        ]
-        self.status(
-            f"云端 OCR：{len(selected)} 帧，{len(batches)} 个 API 请求，模型={config.ocr.model}"
+        observations = (
+            self._load_observations(observations_path, selected, config.ocr.model)
+            if reuse_checkpoints
+            else []
         )
-
-        observations = self._load_observations(observations_path, selected, config.ocr.model)
-        api_calls = self._load_api_calls(api_calls_path)
-        completed_ids = {observation.frame_index for observation in observations}
-        pending = [frame for frame in selected if frame.index not in completed_ids]
-        batches = [
-            pending[index : index + config.ocr.batch_size]
-            for index in range(0, len(pending), config.ocr.batch_size)
-        ]
-        if observations:
-            self.status(
-                f"断点续跑：复用 {len(observations)} 帧结果，"
-                f"剩余 {len(pending)} 帧、{len(batches)} 个请求"
-            )
-        completed_frames = len(observations)
-        saved_batch_indexes = [observation.batch_index for observation in observations]
-        saved_batch_indexes.extend(
-            int(call.get("batch_index", 0))
-            for call in api_calls
-            if isinstance(call.get("batch_index"), int)
+        api_calls = self._load_api_calls(api_calls_path) if reuse_checkpoints else []
+        observations, api_calls = self._recognize_frames(
+            engine=engine,
+            target_frames=selected,
+            observations=observations,
+            api_calls=api_calls,
+            config=config,
+            observations_path=observations_path,
+            api_calls_path=api_calls_path,
+            stage="initial",
         )
-        first_batch_index = max(saved_batch_indexes, default=0) + 1
-        total_batch_count = first_batch_index - 1 + len(batches)
-        for batch_index, batch in enumerate(batches, start=first_batch_index):
-            batch_result = engine.recognize_batch(batch)
-            result_by_id = {item.frame_id: item for item in batch_result.frames}
-            for frame in batch:
-                item = result_by_id[f"{frame.index:06d}"]
-                observations.append(
-                    OcrObservation(
-                        timestamp_ms=frame.timestamp_ms,
-                        frame_index=frame.index,
-                        frame_file=frame.path.name,
-                        diff_score=frame.diff_score,
-                        model=config.ocr.model,
-                        batch_index=batch_index,
-                        request_id=batch_result.request_id,
-                        text=item.text,
-                        confidence=item.confidence,
-                    )
-                )
-            completed_frames += len(batch)
-            api_calls.append(
-                {
-                    "batch_index": batch_index,
-                    "frame_ids": [f"{frame.index:06d}" for frame in batch],
-                    "request_id": batch_result.request_id,
-                    "usage": batch_result.usage,
-                }
-            )
-            write_json(observations_path, observations)
-            write_json(api_calls_path, api_calls)
-            self.status(
-                f"云端 OCR 进度 {completed_frames}/{len(selected)} "
-                f"（请求 {batch_index}/{total_batch_count}）"
-            )
 
         sample_interval_ms = max(1, round(1000 / config.sample_fps))
         segments = build_segments(
@@ -163,13 +157,53 @@ class BurnedSubtitlePipeline:
             review_confidence=config.min_confidence,
             sample_interval_ms=sample_interval_ms,
         )
+        if reference_track is not None:
+            coverage_windows = find_reference_coverage_windows(reference_track, segments)
+            supplemental = select_supplemental_frames(
+                frames,
+                selected,
+                observations,
+                coverage_windows,
+            )
+            if supplemental:
+                self.status(
+                    f"YouTube 字幕发现 {len(coverage_windows)} 个视觉覆盖缺口，"
+                    f"补送 {len(supplemental)} 帧复核…"
+                )
+                observations, api_calls = self._recognize_frames(
+                    engine=engine,
+                    target_frames=supplemental,
+                    observations=observations,
+                    api_calls=api_calls,
+                    config=config,
+                    observations_path=observations_path,
+                    api_calls_path=api_calls_path,
+                    stage="coverage_repair",
+                )
+                segments = build_segments(
+                    observations=observations,
+                    duration_ms=metadata.duration_ms,
+                    similarity_threshold=config.similarity_threshold,
+                    review_confidence=config.min_confidence,
+                    sample_interval_ms=sample_interval_ms,
+                )
+            elif coverage_windows:
+                self.status(
+                    f"YouTube 字幕仍有 {len(coverage_windows)} 个无视觉对应片段；"
+                    "附近抽样帧均已识别，后续综合时保留 YouTube 原文"
+                )
         document = SubtitleDocument(video=metadata, config=config, segments=segments)
         write_json(segments_path, document)
+        self._save_segment_evidence(job_dir, frames_dir, segments, observations)
         markdown_path = export_markdown(
             document, config.output_dir.expanduser().resolve(), config.overwrite
         )
         self.status("保存视频音频…")
-        audio_path = extract_audio(video_path, markdown_path.with_suffix(".m4a"))
+        audio_path = extract_audio(
+            video_path,
+            markdown_path.with_suffix(".m4a"),
+            cancelled=self.cancelled,
+        )
 
         if not config.keep_cache:
             shutil.rmtree(cache_dir, ignore_errors=True)
@@ -187,6 +221,122 @@ class BurnedSubtitlePipeline:
             observation_count=len(observations),
             audio_path=audio_path,
         )
+
+    @staticmethod
+    def _save_segment_evidence(
+        job_dir: Path,
+        frames_dir: Path,
+        segments: list[SubtitleSegment],
+        observations: list[OcrObservation],
+    ) -> None:
+        """Keep a small frame set for conflict-only visual rechecks."""
+        evidence_dir = job_dir / "evidence"
+        shutil.rmtree(evidence_dir, ignore_errors=True)
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        segment_manifest: dict[str, list[dict[str, object]]] = {}
+        for index, segment in enumerate(segments, 1):
+            segment_id = f"ocr{index:06d}"
+            candidates = [
+                item
+                for item in observations
+                if item.text.strip()
+                and segment.start_ms <= item.timestamp_ms <= segment.end_ms
+                and (frames_dir / item.frame_file).is_file()
+            ]
+            indexes = sorted({0, len(candidates) // 2, len(candidates) - 1}) if candidates else []
+            saved: list[dict[str, object]] = []
+            for candidate_index in indexes:
+                observation = candidates[candidate_index]
+                source = frames_dir / observation.frame_file
+                destination = evidence_dir / f"{segment_id}_{source.name}"
+                shutil.copy2(source, destination)
+                saved.append(
+                    {
+                        "frame_index": observation.frame_index,
+                        "timestamp_ms": observation.timestamp_ms,
+                        "path": destination.name,
+                        "first_pass_text": observation.text,
+                    }
+                )
+            segment_manifest[segment_id] = saved
+        write_json(
+            evidence_dir / "segment_evidence.json",
+            {"schema_version": 1, "segments": segment_manifest},
+        )
+
+    def _recognize_frames(
+        self,
+        *,
+        engine: OcrEngine,
+        target_frames: list[FrameRef],
+        observations: list[OcrObservation],
+        api_calls: list[dict[str, object]],
+        config: ExtractionConfig,
+        observations_path: Path,
+        api_calls_path: Path,
+        stage: str,
+    ) -> tuple[list[OcrObservation], list[dict[str, object]]]:
+        completed_ids = {observation.frame_index for observation in observations}
+        pending = [frame for frame in target_frames if frame.index not in completed_ids]
+        batches = [
+            pending[index : index + config.ocr.batch_size]
+            for index in range(0, len(pending), config.ocr.batch_size)
+        ]
+        if len(pending) < len(target_frames):
+            self.status(
+                f"断点续跑：复用 {len(target_frames) - len(pending)} 帧结果，"
+                f"本阶段剩余 {len(pending)} 帧"
+            )
+        if not batches:
+            return observations, api_calls
+        self.status(
+            f"云端 OCR（{stage}）：{len(pending)} 帧，{len(batches)} 个 API 请求，"
+            f"模型={config.ocr.model}"
+        )
+        saved_batch_indexes = [observation.batch_index for observation in observations]
+        saved_batch_indexes.extend(
+            int(call.get("batch_index", 0))
+            for call in api_calls
+            if isinstance(call.get("batch_index"), int)
+        )
+        first_batch_index = max(saved_batch_indexes, default=0) + 1
+        for offset, batch in enumerate(batches):
+            batch_index = first_batch_index + offset
+            batch_result = engine.recognize_batch(batch)
+            result_by_id = {item.frame_id: item for item in batch_result.frames}
+            for frame in batch:
+                item = result_by_id[f"{frame.index:06d}"]
+                observations.append(
+                    OcrObservation(
+                        timestamp_ms=frame.timestamp_ms,
+                        frame_index=frame.index,
+                        frame_file=frame.path.name,
+                        diff_score=frame.diff_score,
+                        model=config.ocr.model,
+                        batch_index=batch_index,
+                        request_id=batch_result.request_id,
+                        text=item.text,
+                        confidence=item.confidence,
+                        line_count=item.line_count,
+                    )
+                )
+            observations.sort(key=lambda item: item.timestamp_ms)
+            api_calls.append(
+                {
+                    "batch_index": batch_index,
+                    "stage": stage,
+                    "frame_ids": [f"{frame.index:06d}" for frame in batch],
+                    "request_id": batch_result.request_id,
+                    "usage": batch_result.usage,
+                }
+            )
+            write_json(observations_path, observations)
+            write_json(api_calls_path, api_calls)
+            self.status(
+                f"云端 OCR（{stage}）进度 "
+                f"{min((offset + 1) * config.ocr.batch_size, len(pending))}/{len(pending)}"
+            )
+        return observations, api_calls
 
     def ensure_audio(self, config: ExtractionConfig, raw_markdown_path: Path) -> Path:
         """Create the audio sidecar for a reusable OCR result without rerunning OCR."""
@@ -216,7 +366,7 @@ class BurnedSubtitlePipeline:
                 config.max_height,
                 cookies_from_browser=config.cookies_from_browser,
             )
-        result = extract_audio(video_path, audio_path)
+        result = extract_audio(video_path, audio_path, cancelled=self.cancelled)
         if not config.keep_cache:
             shutil.rmtree(cache_dir, ignore_errors=True)
         return result
@@ -243,6 +393,24 @@ class BurnedSubtitlePipeline:
                 f"已取得 YouTube {source_label}（{track.language}，{len(track.cues)} 条）"
             )
         return track, path
+
+    @staticmethod
+    def _ocr_checkpoint_compatible(path: Path, config: ExtractionConfig) -> bool:
+        """Reuse paid OCR observations across pipeline revisions when inputs still match."""
+        if not path.is_file():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("sample_fps") == config.sample_fps
+            and payload.get("roi") == config.roi.model_dump(mode="json")
+            and payload.get("language") == config.language
+            and isinstance(payload.get("ocr"), dict)
+            and payload["ocr"].get("model") == config.ocr.model
+        )
 
     @staticmethod
     def _load_observations(path, selected, model: str) -> list[OcrObservation]:

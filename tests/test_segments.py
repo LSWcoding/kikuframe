@@ -46,3 +46,38 @@ def test_creates_distinct_segments() -> None:
         sample_interval_ms=500,
     )
     assert [segment.text for segment in segments] == ["hello", "goodbye"]
+
+
+def test_containment_prefers_complete_visual_subtitle() -> None:
+    segments = build_segments(
+        [
+            observation(0, "本当に自分がやりたいことだけ"),
+            observation(500, "本当に自分がやりたいことだけをするようになり"),
+            observation(1000, "本当に自分がやりたいことだけ"),
+        ],
+        duration_ms=1500,
+        similarity_threshold=82,
+        review_confidence=0.5,
+        sample_interval_ms=500,
+    )
+
+    assert [item.text for item in segments] == [
+        "本当に自分がやりたいことだけをするようになり"
+    ]
+
+
+def test_adjacent_rolling_overlap_is_emitted_once() -> None:
+    segments = build_segments(
+        [
+            observation(0, "上京してそれ以降は"),
+            observation(500, "それ以降はずっと非正規雇用で働いています"),
+        ],
+        duration_ms=1000,
+        similarity_threshold=82,
+        review_confidence=0.5,
+        sample_interval_ms=500,
+    )
+
+    assert [item.text for item in segments] == [
+        "上京してそれ以降はずっと非正規雇用で働いています"
+    ]

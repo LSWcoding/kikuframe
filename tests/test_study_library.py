@@ -87,6 +87,11 @@ def test_library_restores_lemma_adds_contextual_meanings_and_counts(tmp_path: Pa
     assert details["encounters"][0]["meaning"] == "前往"
     assert library.entry_details(9999) is None
 
+    assert library.delete_entry(first["entry_id"]) is True
+    assert library.entry_details(first["entry_id"]) is None
+    assert library.list_entries() == []
+    assert library.delete_entry(first["entry_id"]) is False
+
 
 def test_library_tracks_collocations_and_grammar_independently(tmp_path: Path) -> None:
     library = StudyLibrary(tmp_path / "learning.sqlite3")

@@ -5,6 +5,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -23,7 +24,7 @@ from submd.models import (
 )
 
 StatusCallback = Callable[[str], None]
-_PROMPT_VERSION = "ocr-youtube-reading-fusion-v3"
+_PROMPT_VERSION = "ocr-youtube-reading-fusion-v4"
 _JSON_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
 _SYSTEM_PROMPT = """You correct burned-in subtitle OCR with time-aligned YouTube captions as a
@@ -31,8 +32,9 @@ pronunciation reference. The burned-in subtitle remains the visual source of tru
 captions describe what was spoken and may omit, summarize, or phrase the on-screen text
 differently.
 
-Return only target segments whose OCR text should actually be changed. Omitted target segments are
-kept verbatim. Every returned item must use the same segment_id supplied in target_segments.
+Return target segments whose OCR text should actually be changed. Every target marked
+reference_conflict=true MUST also be returned, even when you decide to keep it unchanged. Every
+returned item must use the same segment_id supplied in target_segments.
 Rules:
 1. Correct likely OCR character errors, missing characters, and obvious repeated fragments only
    when confidence, alternatives, neighboring OCR, and the spoken reference support the change.
@@ -44,7 +46,11 @@ Rules:
    later stage.
 5. Correct each segment independently. Never move words into or out of neighboring segments. If a
    fix would require redistributing text across segments, omit that correction.
-6. If evidence is insufficient, omit the segment and keep the original OCR text unchanged.
+6. If evidence is insufficient and reference_conflict=false, omit the segment and keep the
+   original OCR text unchanged. For a flagged conflict, return it unchanged with a reason instead.
+7. OCR confidence is self-reported visual legibility, not proof that its characters are correct.
+   When the OCR and YouTube reference share a long exact surrounding phrase but differ in a short
+   word, treat the reference as strong disambiguating evidence even if OCR confidence is high.
 
 Return JSON only:
 {"corrections":[{"segment_id":"seg000001","corrected_text":"verbatim result",
@@ -83,6 +89,9 @@ class OpenAICompatibleFusionEngine:
         after_context: list[dict[str, Any]],
     ) -> tuple[list[CaptionCorrection], str | None, dict[str, Any]]:
         target_ids = {str(item["segment_id"]) for item in targets}
+        required_ids = {
+            str(item["segment_id"]) for item in targets if item.get("reference_conflict") is True
+        }
         payload: dict[str, Any] = {
             "model": self.config.model,
             "temperature": 0,
@@ -122,6 +131,12 @@ class OpenAICompatibleFusionEngine:
                     for item in corrections
                     if item.segment_id in target_ids
                 }
+                missing_required = required_ids - target_corrections.keys()
+                if missing_required:
+                    raise ValueError(
+                        "missing decisions for reference conflicts: "
+                        + ", ".join(sorted(missing_required))
+                    )
                 return (
                     list(target_corrections.values()),
                     response.headers.get("x-request-id") or envelope.get("id"),
@@ -346,6 +361,7 @@ class SubtitleFusion:
         index: int, segment: SubtitleSegment, track: YouTubeCaptionTrack
     ) -> dict[str, Any]:
         references = aligned_cues(track, segment.start_ms, segment.end_ms)
+        reference_texts = [cue.text for cue in references]
         return {
             "segment_id": f"seg{index:06d}",
             "start_ms": segment.start_ms,
@@ -357,7 +373,26 @@ class SubtitleFusion:
                 {"start_ms": cue.start_ms, "end_ms": cue.end_ms, "text": cue.text}
                 for cue in references
             ],
+            "reference_conflict": SubtitleFusion._reference_conflict(
+                segment.text, reference_texts
+            ),
         }
+
+    @staticmethod
+    def _reference_conflict(ocr_text: str, references: list[str]) -> bool:
+        def comparable(value: str) -> str:
+            return re.sub(r"[\s、。，．,.!?！？:：;；'\"“”‘’]+", "", value)
+
+        ocr = comparable(ocr_text)
+        if len(ocr) < 6:
+            return False
+        for raw_reference in references:
+            reference = comparable(raw_reference)
+            if not reference or ocr in reference or reference in ocr:
+                continue
+            if SequenceMatcher(None, ocr, reference).ratio() >= 0.74:
+                return True
+        return False
 
     @staticmethod
     def _fingerprint(

@@ -35,9 +35,12 @@ Rules:
 5. If no burned-in subtitle is visible, return an empty text string.
 6. Confidence is only a visual-legibility score from 0 to 1, not semantic certainty.
 7. Return exactly one result for every supplied frame_id.
+8. Never infer text from speech context or from another frame. Read each image independently.
+9. line_count is the number of visible burned-in subtitle rows (0 when text is empty).
 
 Return JSON only:
-{"frames":[{"frame_id":"000001","text":"verbatim subtitle or empty","confidence":0.95}]}
+{"frames":[{"frame_id":"000001","text":"verbatim subtitle or empty",
+"confidence":0.95,"line_count":1}]}
 """
 
 
@@ -114,7 +117,12 @@ class OpenAICompatibleOcrEngine:
         ]
         for frame in frames:
             frame_id = self._frame_id(frame)
-            content.append({"type": "text", "text": f"frame_id={frame_id}"})
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"frame_id={frame_id}",
+                }
+            )
             content.append(
                 {
                     "type": "image_url",
@@ -218,14 +226,24 @@ class OpenAICompatibleOcrEngine:
             content = envelope["choices"][0]["message"]["content"]
             text = self._content_text(content)
             payload = self._extract_json(text)
-            frames = [
-                CloudOcrFrameResult(
-                    frame_id=str(item["frame_id"]),
-                    text=normalize_text(str(item.get("text") or "")),
-                    confidence=item.get("confidence", 0.5),
+            frames: list[CloudOcrFrameResult] = []
+            for item in payload["frames"]:
+                normalized = normalize_text(str(item.get("text") or ""))
+                reported_line_count = item.get("line_count")
+                inferred_line_count = len(normalized.splitlines()) if normalized else 0
+                frames.append(
+                    CloudOcrFrameResult(
+                        frame_id=str(item["frame_id"]),
+                        text=normalized,
+                        confidence=item.get("confidence", 0.5),
+                        line_count=max(
+                            inferred_line_count,
+                            int(reported_line_count)
+                            if isinstance(reported_line_count, (int, float))
+                            else 0,
+                        ),
+                    )
                 )
-                for item in payload["frames"]
-            ]
             return CloudOcrBatchResult(
                 frames=frames,
                 request_id=response.headers.get("x-request-id") or envelope.get("id"),

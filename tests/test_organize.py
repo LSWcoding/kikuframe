@@ -130,7 +130,12 @@ def test_boundary_engine_sends_units_and_parses_json() -> None:
         assert body["response_format"] == {"type": "json_object"}
         user_payload = json.loads(body["messages"][1]["content"])
         assert user_payload["target_units"] == [
-            {"unit_id": "u000001", "text": "今日は学校へ行きます", "text_length": 10}
+            {
+                "unit_id": "u000001",
+                "text": "今日は学校へ行きます",
+                "text_length": 10,
+                "allowed_after_chars": [10],
+            }
         ]
         return httpx.Response(
             200,
@@ -150,6 +155,56 @@ def test_boundary_engine_sends_units_and_parses_json() -> None:
     assert result.break_after == frozenset({"u000001"})
     assert result.request_id == "boundary-request"
     assert result.usage == {"total_tokens": 20}
+
+
+def test_boundary_engine_rejects_split_inside_fixed_expression_and_repairs() -> None:
+    target = [SubtitleUnit(unit_id="u000001", text="お電話ありがとうございます。")]
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        body = json.loads(request.content)
+        unit = json.loads(body["messages"][1]["content"])["target_units"][0]
+        assert unit["allowed_after_chars"] == [14]
+        if calls == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": ('{"boundaries":[{"unit_id":"u000001","after_char":9}]}')
+                            }
+                        }
+                    ]
+                },
+            )
+        assert "forbidden sentence boundaries" in body["messages"][-1]["content"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": ('{"boundaries":[{"unit_id":"u000001","after_char":14}]}')
+                        }
+                    }
+                ]
+            },
+        )
+
+    engine = OpenAICompatibleBoundaryEngine(
+        TextLlmConfig(base_url="https://vendor.example/v1", model="text-model"),
+        "secret-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    result = engine.decide_boundaries([], target, [])
+
+    assert calls == 2
+    assert result.break_after == frozenset({"u000001"})
+    assert result.split_after == frozenset()
 
 
 def test_boundary_engine_ignores_context_ids() -> None:
@@ -184,8 +239,7 @@ def test_organizer_can_split_inside_an_ocr_unit_and_interpolate_timing(
 
     source = tmp_path / "字符断句.md"
     source.write_text(
-        "- [00:00.000–00:01.000] フリーダー\n"
-        "- [00:01.000–00:04.000] ですさっき病院に行ったら\n",
+        "- [00:00.000–00:01.000] フリーダー\n- [00:01.000–00:04.000] ですさっき病院に行ったら\n",
         encoding="utf-8",
     )
     result = SubtitleOrganizer(boundary_engine=CharacterBoundaryEngine()).run(
@@ -206,6 +260,37 @@ def test_organizer_can_split_inside_an_ocr_unit_and_interpolate_timing(
     assert checkpoint["chunks"]["000001"]["split_after"] == [
         {"unit_id": "u000002", "after_char": 2}
     ]
+
+
+def test_boundary_before_terminal_punctuation_does_not_create_fake_sentence(
+    tmp_path: Path,
+) -> None:
+    class BeforePunctuationEngine:
+        def decide_boundaries(self, _before, target, _after) -> BoundaryResult:
+            unit = target[0]
+            return BoundaryResult(
+                break_after=frozenset({unit.unit_id}),
+                split_after=frozenset({(unit.unit_id, len(unit.text) - 1)}),
+            )
+
+    source = tmp_path / "标点.md"
+    source.write_text(
+        "- [00:00.000–00:02.000] 字幕です。\n",
+        encoding="utf-8",
+    )
+    result = SubtitleOrganizer(boundary_engine=BeforePunctuationEngine()).run(
+        source,
+        TextLlmConfig(base_url="https://vendor.example/v1", model="text-model"),
+        workspace_root=tmp_path / "workspace",
+        output_dir=tmp_path / "output",
+        overwrite=True,
+    )
+
+    assert result.sentence_count == 1
+    assert result.markdown_path.read_text(encoding="utf-8") == "字幕です。\n"
+    document = json.loads(result.sentences_path.read_text(encoding="utf-8"))
+    assert document["sentences"][0]["start_ms"] == 0
+    assert document["sentences"][0]["end_ms"] == 2000
 
 
 def test_youtube_reading_reference_adds_only_aligned_sentence_boundaries(
@@ -248,3 +333,68 @@ def test_youtube_reading_reference_adds_only_aligned_sentence_boundaries(
     )
     document = json.loads(result.sentences_path.read_text(encoding="utf-8"))
     assert document["sentences"][1]["end_ms"] == document["sentences"][2]["start_ms"]
+
+
+def test_youtube_reference_boundary_keeps_terminal_punctuation_with_previous_sentence(
+    tmp_path: Path,
+) -> None:
+    class FinalBoundaryOnlyEngine:
+        def decide_boundaries(self, _before, target, _after) -> BoundaryResult:
+            return BoundaryResult(break_after=frozenset({target[-1].unit_id}))
+
+    source = tmp_path / "标点参考.md"
+    source.write_text(
+        "- [00:00.000–00:04.000] お電話ありがとうございます。こちらです。\n",
+        encoding="utf-8",
+    )
+    track = YouTubeCaptionTrack(
+        video_id="sample",
+        language="ja",
+        source="automatic",
+        cues=[
+            YouTubeCaptionCue(
+                cue_id="yt000001",
+                start_ms=0,
+                end_ms=4000,
+                text="お電話ありがとうございます。こちらです。",
+            )
+        ],
+    )
+
+    result = SubtitleOrganizer(boundary_engine=FinalBoundaryOnlyEngine()).run(
+        source,
+        TextLlmConfig(base_url="https://vendor.example/v1", model="text-model"),
+        workspace_root=tmp_path / "workspace",
+        output_dir=tmp_path / "output",
+        overwrite=True,
+        reference_track=track,
+    )
+
+    assert result.markdown_path.read_text(encoding="utf-8") == (
+        "お電話ありがとうございます。\nこちらです。\n"
+    )
+    document = json.loads(result.sentences_path.read_text(encoding="utf-8"))
+    assert all(not item["text"].startswith("。") for item in document["sentences"])
+
+
+def test_leading_terminal_punctuation_is_moved_to_previous_sentence() -> None:
+    units = [
+        SubtitleUnit(
+            unit_id="u000001",
+            text="お電話ありがとうございます。こちらです。",
+            start_ms=0,
+            end_ms=4000,
+            source_segment_ids=("seg000001",),
+        )
+    ]
+
+    sentences = SubtitleOrganizer._build_sentences(
+        units,
+        breaks={"u000001"},
+        split_after={("u000001", 13), ("u000001", 20)},
+    )
+
+    assert [sentence.text for sentence in sentences] == [
+        "お電話ありがとうございます。",
+        "こちらです。",
+    ]

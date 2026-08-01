@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from PIL import Image, ImageDraw, ImageFont
 
 from submd.models import (
     CloudOcrBatchResult,
@@ -65,16 +66,30 @@ class FakeCloudOcr:
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="FFmpeg is required")
 def test_pipeline_writes_json_and_markdown(tmp_path: Path) -> None:
     video = tmp_path / "synthetic.mp4"
+    frames_dir = tmp_path / "source-frames"
+    frames_dir.mkdir()
+    font = ImageFont.load_default(size=44)
+    for index, text in enumerate(("HELLO", "HELLO", "WORLD", "WORLD"), start=1):
+        image = Image.new("RGB", (320, 180), "black")
+        ImageDraw.Draw(image).text(
+            (70, 120),
+            text,
+            font=font,
+            fill="white",
+            stroke_width=4,
+            stroke_fill="black",
+        )
+        image.save(frames_dir / f"frame_{index:06d}.jpg", quality=95)
     subprocess.run(
         [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
             "error",
-            "-f",
-            "lavfi",
+            "-framerate",
+            "2",
             "-i",
-            "color=c=black:s=320x180:r=2:d=2",
+            str(frames_dir / "frame_%06d.jpg"),
             "-f",
             "lavfi",
             "-i",
@@ -95,7 +110,7 @@ def test_pipeline_writes_json_and_markdown(tmp_path: Path) -> None:
         sample_fps=2,
         change_threshold=0.01,
         max_ocr_interval=0.5,
-        keep_cache=True,
+        keep_cache=False,
         ocr=CloudOcrConfig(
             base_url="https://vendor.example/v1",
             model="vision-ocr",
@@ -108,7 +123,7 @@ def test_pipeline_writes_json_and_markdown(tmp_path: Path) -> None:
     ).run(config)
 
     assert result.segment_count == 2
-    assert result.observation_count == 4
+    assert result.observation_count == 2
     assert result.markdown_path.is_file()
     assert result.audio_path is not None
     assert result.audio_path.is_file()
@@ -119,4 +134,41 @@ def test_pipeline_writes_json_and_markdown(tmp_path: Path) -> None:
     assert "vision-ocr" in saved_config
     assert "secret" not in saved_config
     calls = json.loads(result.api_calls_path.read_text(encoding="utf-8"))
-    assert len(calls) == 2
+    assert len(calls) == 1
+    evidence_path = (
+        tmp_path / "workspace" / "synthetic" / "evidence" / "segment_evidence.json"
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert set(evidence["segments"]) == {"ocr000001", "ocr000002"}
+    saved_frames = [
+        item["path"]
+        for items in evidence["segments"].values()
+        for item in items
+    ]
+    assert saved_frames
+    assert all((evidence_path.parent / name).is_file() for name in saved_frames)
+    assert not (tmp_path / "workspace" / "synthetic" / "frames").exists()
+
+
+def test_old_pipeline_revision_can_reuse_matching_paid_ocr_observations(
+    tmp_path: Path,
+) -> None:
+    config = ExtractionConfig(
+        source_url="https://youtu.be/synthetic",
+        workspace_root=tmp_path / "workspace",
+        output_dir=tmp_path / "output",
+        ocr=CloudOcrConfig(
+            base_url="https://vendor.example/v1",
+            model="vision-ocr",
+        ),
+    )
+    saved = config.model_dump(mode="json")
+    saved["pipeline_revision"] = "youtube-primary-v1"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+    assert BurnedSubtitlePipeline._ocr_checkpoint_compatible(path, config) is True
+
+    saved["ocr"]["model"] = "different-model"
+    path.write_text(json.dumps(saved), encoding="utf-8")
+    assert BurnedSubtitlePipeline._ocr_checkpoint_compatible(path, config) is False

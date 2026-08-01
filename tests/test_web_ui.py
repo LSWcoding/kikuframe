@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 import time
 from pathlib import Path
@@ -9,7 +10,12 @@ from urllib.request import Request, urlopen
 
 from submd.errors import DownloadError, OrganizeError
 from submd.models import ExtractionResult, OrganizeResult, SentenceLearningAnalysis
-from submd.web import EnvironmentStore, ExtractionJobManager, create_ui_server
+from submd.web import (
+    EnvironmentStore,
+    ExtractionJobManager,
+    _extraction_process_entry,
+    create_ui_server,
+)
 
 
 def config_payload() -> dict[str, str]:
@@ -18,9 +24,16 @@ def config_payload() -> dict[str, str]:
         "SUBMD_OCR_BASE_URL": "https://vendor.example/v1",
         "SUBMD_OCR_MODEL": "vision-model",
         "SUBMD_OCR_API_KEY": "secret-key",
+        "SUBMD_OCR_REVIEW_BASE_URL": "",
+        "SUBMD_OCR_REVIEW_MODEL": "",
+        "SUBMD_OCR_REVIEW_API_KEY": "",
         "SUBMD_YOUTUBE_COOKIES_FROM_BROWSER": "chrome",
         "SUBMD_TEXT_BASE_URL": "",
         "SUBMD_TEXT_MODEL": "text-model",
+        "SUBMD_TEXT_API_KEY": "",
+        "SUBMD_BOUNDARY_BASE_URL": "",
+        "SUBMD_BOUNDARY_MODEL": "",
+        "SUBMD_BOUNDARY_API_KEY": "",
         "SUBMD_LEARNING_BASE_URL": "",
         "SUBMD_LEARNING_MODEL": "",
         "SUBMD_LEARNING_API_KEY": "",
@@ -124,9 +137,7 @@ class SuccessfulAnalyzer:
                         "meaning": "第二句",
                     }
                 ],
-                grammar=[
-                    {"pattern": "です", "lemma": "です", "explanation": "礼貌判断句。"}
-                ],
+                grammar=[{"pattern": "です", "lemma": "です", "explanation": "礼貌判断句。"}],
             ),
             False,
         )
@@ -149,6 +160,102 @@ def test_environment_store_never_returns_api_key(tmp_path: Path) -> None:
     private = store.read_private()
     assert private["SUBMD_OCR_BASE_URL"] == "https://new.example/v1"
     assert private["SUBMD_OCR_API_KEY"] == "stored-secret"
+
+
+def test_model_role_values_use_first_concrete_value_in_each_column() -> None:
+    values = config_payload() | {
+        "SUBMD_OCR_BASE_URL": "",
+        "SUBMD_OCR_MODEL": "",
+        "SUBMD_OCR_API_KEY": "",
+        "SUBMD_OCR_REVIEW_BASE_URL": "https://review.example/v1",
+        "SUBMD_OCR_REVIEW_MODEL": "",
+        "SUBMD_OCR_REVIEW_API_KEY": "",
+        "SUBMD_TEXT_BASE_URL": "https://text.example/v1",
+        "SUBMD_TEXT_MODEL": "text-model",
+        "SUBMD_TEXT_API_KEY": "",
+        "SUBMD_BOUNDARY_BASE_URL": "",
+        "SUBMD_BOUNDARY_MODEL": "boundary-model",
+        "SUBMD_BOUNDARY_API_KEY": "",
+        "SUBMD_LEARNING_BASE_URL": "",
+        "SUBMD_LEARNING_MODEL": "",
+        "SUBMD_LEARNING_API_KEY": "learning-key",
+    }
+
+    resolved = ExtractionJobManager._resolve_model_values(values)
+
+    for prefix in (
+        "SUBMD_OCR",
+        "SUBMD_OCR_REVIEW",
+        "SUBMD_TEXT",
+        "SUBMD_BOUNDARY",
+        "SUBMD_LEARNING",
+    ):
+        assert resolved[f"{prefix}_BASE_URL"] in {
+            "https://review.example/v1",
+            "https://text.example/v1",
+        }
+        assert resolved[f"{prefix}_MODEL"] in {"text-model", "boundary-model"}
+        assert resolved[f"{prefix}_API_KEY"] == "learning-key"
+    assert resolved["SUBMD_OCR_BASE_URL"] == "https://review.example/v1"
+    assert resolved["SUBMD_OCR_MODEL"] == "text-model"
+    assert resolved["SUBMD_OCR_API_KEY"] == "learning-key"
+
+
+def test_model_role_api_keys_are_passed_to_separate_clients(tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingPipeline:
+        def run(self, config) -> ExtractionResult:
+            captured["ocr_config"] = config.ocr
+            raw = config.output_dir / "独立模型测试.md"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_text("测试字幕\n", encoding="utf-8")
+            intermediate = config.workspace_root / "test.json"
+            intermediate.parent.mkdir(parents=True, exist_ok=True)
+            intermediate.write_text("{}\n", encoding="utf-8")
+            return ExtractionResult(
+                metadata_path=intermediate,
+                config_path=intermediate,
+                observations_path=intermediate,
+                api_calls_path=intermediate,
+                segments_path=intermediate,
+                markdown_path=raw,
+                segment_count=1,
+                observation_count=1,
+            )
+
+    class CapturingOrganizer(SuccessfulOrganizer):
+        def run(self, source_path, config, workspace_root, output_dir, overwrite):
+            captured["boundary_config"] = config
+            return super().run(source_path, config, workspace_root, output_dir, overwrite)
+
+    learning_capture: dict = {}
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda _status, key: captured.update(ocr_key=key) or CapturingPipeline(),
+        organizer_factory=lambda _status, key: (
+            captured.update(boundary_key=key) or CapturingOrganizer()
+        ),
+        analyzer_factory=lambda key: SuccessfulAnalyzer(key, learning_capture),
+    )
+    payload = config_payload() | {
+        "SUBMD_OCR_MODEL": "shared-name",
+        "SUBMD_OCR_API_KEY": "ocr-key",
+        "SUBMD_BOUNDARY_MODEL": "shared-name",
+        "SUBMD_BOUNDARY_API_KEY": "boundary-key",
+        "SUBMD_LEARNING_MODEL": "shared-name",
+        "SUBMD_LEARNING_API_KEY": "learning-key",
+    }
+
+    job = wait_for_job(manager, manager.start(payload)["job_id"])
+    manager.analyze_sentence(job["job_id"], "s000001")
+
+    assert captured["ocr_key"] == "ocr-key"
+    assert captured["boundary_key"] == "boundary-key"
+    assert learning_capture["api_key"] == "learning-key"
+    assert captured["ocr_config"].model == "shared-name"
+    assert captured["boundary_config"].model == "shared-name"
+    assert captured["ocr_config"] is not captured["boundary_config"]
 
 
 def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
@@ -199,12 +306,14 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
     ]
     assert finished["player_url"] == f"/api/player/{started['job_id']}"
     assert manager.result_file(started["job_id"]).read_text(encoding="utf-8") == "测试字幕\n"
-    assert manager.result_file(started["job_id"], "organized").read_text(
-        encoding="utf-8"
-    ) == "第一句话。\n第二句话。\n"
+    assert (
+        manager.result_file(started["job_id"], "organized").read_text(encoding="utf-8")
+        == "第一句话。\n第二句话。\n"
+    )
     history = manager.history()
     assert len(history) == 1
     assert history[0]["status"] == "succeeded"
+    assert history[0]["video_title"] == "测试视频"
     assert "result_path" not in history[0]
     assert all("path" not in item for item in history[0]["results"])
     player = manager.player_data(started["job_id"])
@@ -213,13 +322,14 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
     assert player["analysis_url"] == f"/api/player/{started['job_id']}/analysis"
     assert player["library_url"] == f"/api/player/{started['job_id']}/library"
     assert player["resegment_url"] == f"/api/player/{started['job_id']}/resegment"
+    assert player["sentence_delete_url"] == f"/api/player/{started['job_id']}/sentences"
     analysis = manager.analyze_sentence(started["job_id"], "s000002")
     assert analysis["translation"] == "第二句话的翻译。"
     assert analysis["cached"] is False
     assert learning_capture == {
         "sentence": "第二句话。",
         "base_url": "https://vendor.example/v1",
-        "model": "text-model",
+        "model": "vision-model",
         "api_key": "secret-key",
         "cache_root": str(tmp_path / "workspace" / "learning"),
         "force": False,
@@ -255,6 +365,24 @@ def test_job_manager_records_success_and_download(tmp_path: Path) -> None:
     assert resegmented["sentences"][0]["start_ms"] == 0
     assert resegmented["sentences"][0]["end_ms"] == 2000
     assert (tmp_path / "workspace" / "manual-edits").is_dir()
+    sentence_deleted = manager.delete_sentence(
+        started["job_id"], resegmented["sentences"][0]["sentence_id"]
+    )
+    assert sentence_deleted["deleted"] is True
+    assert sentence_deleted["sentence_count"] == 0
+    assert sentence_deleted["library_preserved"] is True
+
+    raw_file = manager.result_file(started["job_id"])
+    audio_file = manager.player_audio_file(started["job_id"])
+    entry_id = saved["library"]["entry_id"]
+    deleted = manager.delete_history_entry(started["job_id"])
+    assert deleted["library_preserved"] is True
+    assert manager.history() == []
+    assert not raw_file.exists()
+    assert not audio_file.exists()
+    preserved = manager.learning_library_entry(entry_id)
+    assert preserved["encounters"][0]["sentence"] == "第二句话。"
+    assert preserved["encounters"][0]["source_url"] == "https://youtu.be/ui-test"
 
 
 def test_job_manager_records_failure_reason(tmp_path: Path) -> None:
@@ -272,6 +400,161 @@ def test_job_manager_records_failure_reason(tmp_path: Path) -> None:
     assert finished["status"] == "failed"
     assert finished["error"] == "YouTube 拒绝访问测试视频"
     assert manager.history()[0]["error"] == "YouTube 拒绝访问测试视频"
+
+
+def test_cancel_stops_job_and_deletes_all_source_data(tmp_path: Path) -> None:
+    pipeline_started = threading.Event()
+
+    class CancellablePipeline:
+        def __init__(self, status) -> None:
+            self.status = status
+
+        def run(self, config):
+            video_root = config.workspace_root / "ui-test"
+            video_root.mkdir(parents=True, exist_ok=True)
+            (video_root / "partial.json").write_text("{}\n", encoding="utf-8")
+            output = config.output_dir / "中止测试.md"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                '---\nsource_url: "https://youtu.be/ui-test"\n---\n\n部分字幕\n',
+                encoding="utf-8",
+            )
+            output.with_suffix(".m4a").write_bytes(b"partial-audio")
+            pipeline_started.set()
+            while True:
+                time.sleep(0.01)
+                self.status("仍在处理测试数据…")
+
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda status, _key: CancellablePipeline(status),
+    )
+    started = manager.start(config_payload())
+    assert pipeline_started.wait(timeout=1)
+
+    cancelled = manager.cancel(started["job_id"])
+    if cancelled["status"] == "cancelling":
+        cancelled = wait_for_job(manager, started["job_id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["deleted_file_count"] >= 2
+    assert manager.history() == []
+    assert not (tmp_path / "workspace" / "ui-test").exists()
+    assert not (tmp_path / "output" / "中止测试.md").exists()
+    assert not (tmp_path / "output" / "中止测试.m4a").exists()
+    assert (tmp_path / "workspace" / "learning" / "library.sqlite3").is_file()
+
+
+def test_delete_running_history_force_terminates_process_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.alive = True
+            self.terminate_called = False
+            self.kill_called = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminate_called = True
+            self.alive = False
+
+        def kill(self) -> None:
+            self.kill_called = True
+            self.alive = False
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+    manager = ExtractionJobManager(
+        tmp_path,
+        pipeline_factory=lambda _status, _key: object(),
+    )
+    job_id = "force-stop-job"
+    source_url = "https://youtu.be/force-stop"
+    record = {
+        "job_id": job_id,
+        "status": "running",
+        "source_url": source_url,
+        "started_at": "2026-07-31T23:00:00+08:00",
+        "message": "提取中",
+    }
+    partial = tmp_path / "workspace" / "force-stop" / "video.webm.part"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"partial download")
+    process = FakeProcess()
+    with manager._lock:
+        manager._jobs[job_id] = dict(record)
+        manager._history = [dict(record)]
+        manager._job_cancel_events[job_id] = threading.Event()
+        manager._job_processes[job_id] = process
+        manager._persist_history_locked()
+
+    deleted = manager.delete_history_entry(job_id)
+
+    assert process.terminate_called is True
+    assert process.kill_called is False
+    assert deleted["status"] == "cancelled"
+    assert deleted["deleted"] is True
+    assert manager.history() == []
+    assert not partial.parent.exists()
+
+
+def test_extraction_worker_process_reports_final_failure(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    events = context.Queue()
+    job_id = "worker-smoke-test"
+    record = {
+        "job_id": job_id,
+        "status": "running",
+        "source_url": "https://youtu.be/worker-smoke",
+        "started_at": "2026-07-31T23:00:00+08:00",
+        "message": "任务已创建",
+    }
+    process = context.Process(
+        target=_extraction_process_entry,
+        args=(str(tmp_path), job_id, record, {}, events),
+    )
+
+    process.start()
+    process.join(timeout=5)
+
+    assert process.exitcode == 0
+    event = events.get(timeout=2)
+    assert event["kind"] == "final"
+    assert event["record"]["status"] == "failed"
+    assert event["record"]["message"] == "提取失败"
+    events.close()
+
+
+def test_worker_progress_updates_live_history_record(tmp_path: Path) -> None:
+    manager = ExtractionJobManager(tmp_path)
+    job_id = "live-status-job"
+    record = {
+        "job_id": job_id,
+        "status": "running",
+        "source_url": "https://youtu.be/live-status",
+        "started_at": "2026-07-31T23:00:00+08:00",
+        "message": "任务已创建",
+    }
+    with manager._lock:
+        manager._jobs[job_id] = dict(record)
+        manager._history = [dict(record)]
+        manager._job_cancel_events[job_id] = threading.Event()
+
+    manager._apply_worker_event(
+        job_id,
+        {
+            "kind": "update",
+            "job_id": job_id,
+            "changes": {"message": "已下载 42%，正在继续…"},
+        },
+    )
+
+    assert manager.job(job_id)["message"] == "已下载 42%，正在继续…"
+    assert manager.history()[0]["message"] == "已下载 42%，正在继续…"
 
 
 def test_retry_reuses_raw_markdown_after_organizer_failure(tmp_path: Path) -> None:
@@ -367,6 +650,50 @@ def test_existing_subtitle_markdown_is_imported_into_history(tmp_path: Path) -> 
     assert [item["kind"] for item in history[0]["results"]] == ["raw", "organized"]
 
 
+def test_clear_history_removes_extraction_assets_but_keeps_library_database(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    subtitle = output / "待清空字幕.md"
+    subtitle.write_text(
+        '---\nsource_url: "https://youtu.be/clear-me"\n---\n\n字幕\n',
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    video_dir = workspace / "clear-me"
+    video_dir.mkdir(parents=True)
+    (video_dir / "segments.json").write_text("{}\n", encoding="utf-8")
+    manager = ExtractionJobManager(tmp_path)
+    saved = manager.study_library.save(
+        kind="word",
+        lemma="残る",
+        surface="残る",
+        reading="のこる",
+        meaning="保留",
+        context_key="clear-context",
+        source_url="https://youtu.be/clear-me",
+        job_id=manager.history()[0]["job_id"],
+        sentence_id="s1",
+        sentence="この来源句は残る。",
+    )
+    learning_cache = workspace / "learning" / "analysis.json"
+    learning_cache.write_text("{}\n", encoding="utf-8")
+
+    result = manager.clear_history()
+
+    assert result["library_preserved"] is True
+    assert result["deleted_record_count"] == 1
+    assert manager.history() == []
+    assert not subtitle.exists()
+    assert not video_dir.exists()
+    assert not learning_cache.exists()
+    assert (
+        manager.study_library.entry_details(saved["entry_id"])["encounters"][0]["sentence"]
+        == "この来源句は残る。"
+    )
+
+
 def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
     manager = ExtractionJobManager(tmp_path)
     manager.save_config(config_payload())
@@ -380,7 +707,9 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
         assert "KikuFrame" in html
         assert "AI 日语视频学习工具" in html
         assert 'id="extract-button"' in html
+        assert 'id="cancel-job"' in html
         assert 'id="history-body"' in html
+        assert 'id="clear-history"' in html
         assert 'id="error-dialog"' in html
         assert 'id="player-panel"' in html
         assert 'id="loop-sentence"' in html
@@ -392,10 +721,14 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
         assert 'id="open-library"' in html
         assert 'id="library-dialog"' in html
         assert 'id="export-library"' in html
+        assert html.count('class="model-card"') == 5
+        assert 'name="SUBMD_OCR_REVIEW_API_KEY"' in html
+        assert 'name="SUBMD_TEXT_API_KEY"' in html
+        assert 'name="SUBMD_BOUNDARY_API_KEY"' in html
 
         with urlopen(f"{base}/assets/app.js", timeout=2) as response:
             script = response.read().decode()
-        assert '"failed", ["partial", "failed", "interrupted"]' in script
+        assert '"failed", ["partial", "failed", "interrupted", "cancelled"]' in script
         assert "data-sentence-index" in script
         assert "data-analysis-index" in script
         assert "data-library-type" in script
@@ -409,13 +742,31 @@ def test_http_ui_serves_assets_config_and_errors(tmp_path: Path) -> None:
         assert "saveBoundaryEdit" in script
         assert "openStudyLibrary" in script
         assert "toggleLibraryOccurrences" in script
+        assert "data-library-delete" in script
+        assert "data-history-delete" in script
+        assert "data-sentence-delete" in script
+        assert "deletePlayerSentence" in script
+        assert "clearHistory" in script
         assert "/api/library/export" in script
+        assert "renderSharedSuggestions" in script
+        assert "data-shared-value" in script
+        assert "cancelActiveJob" in script
+        assert "中止并删除本次数据" in script
+        assert "data-history-status" in script
+        assert "viewHistoryJob" in script
+        assert 'data-force-stop="true"' in script
 
         with urlopen(f"{base}/api/config", timeout=2) as response:
             config = json.loads(response.read())
         assert config["SUBMD_OCR_API_KEY_CONFIGURED"] is True
+        assert config["SUBMD_OCR_REVIEW_API_KEY_CONFIGURED"] is False
+        assert config["SUBMD_TEXT_API_KEY_CONFIGURED"] is False
+        assert config["SUBMD_BOUNDARY_API_KEY_CONFIGURED"] is False
         assert config["SUBMD_LEARNING_API_KEY_CONFIGURED"] is False
         assert "SUBMD_OCR_API_KEY" not in config
+        assert "SUBMD_OCR_REVIEW_API_KEY" not in config
+        assert "SUBMD_TEXT_API_KEY" not in config
+        assert "SUBMD_BOUNDARY_API_KEY" not in config
         assert "SUBMD_LEARNING_API_KEY" not in config
         assert "secret-key" not in json.dumps(config)
 
@@ -527,6 +878,16 @@ def test_http_player_supports_clickable_sentences_and_ranges(tmp_path: Path) -> 
         assert exported_library == "第二句（だいにく）：第二句\n"
         assert "KikuFrame-%E5%8D%95%E8%AF%8D%E5%BA%93.md" in disposition
 
+        delete_library_request = Request(
+            f"{base}/api/library/{entry_id}",
+            method="DELETE",
+        )
+        with urlopen(delete_library_request, timeout=2) as response:
+            deleted_library = json.loads(response.read())
+        assert deleted_library["deleted"] is True
+        with urlopen(f"{base}/api/library", timeout=2) as response:
+            assert json.loads(response.read())["entry_count"] == 0
+
         request = Request(
             f"{base}{player['audio_url']}",
             headers={"Range": "bytes=2-5"},
@@ -535,6 +896,27 @@ def test_http_player_supports_clickable_sentences_and_ranges(tmp_path: Path) -> 
             assert response.status == 206
             assert response.headers["Content-Range"] == "bytes 2-5/10"
             assert response.read() == b"2345"
+
+        delete_sentence_request = Request(
+            f"{base}{player['sentence_delete_url']}/s000001",
+            method="DELETE",
+        )
+        with urlopen(delete_sentence_request, timeout=2) as response:
+            deleted_sentence = json.loads(response.read())
+        assert deleted_sentence["deleted"] is True
+        assert deleted_sentence["library_preserved"] is True
+        assert deleted_sentence["sentence_count"] == 1
+        assert deleted_sentence["sentences"][0]["text"] == "第二句话。"
+
+        delete_history_request = Request(
+            f"{base}/api/history/{job['job_id']}",
+            method="DELETE",
+        )
+        with urlopen(delete_history_request, timeout=2) as response:
+            deleted_history = json.loads(response.read())
+        assert deleted_history["deleted"] is True
+        with urlopen(f"{base}/api/history", timeout=2) as response:
+            assert json.loads(response.read())["items"] == []
     finally:
         server.shutdown()
         server.server_close()
@@ -553,15 +935,12 @@ def test_history_paths_survive_project_directory_rename(tmp_path: Path) -> None:
         "job_id": "renamed-project-job",
         "status": "succeeded",
         "audio_path": "/old/location/youtube-subtitle-md/output/sample.m4a",
-        "sentences_path": (
-            "/old/location/youtube-subtitle-md/workspace/sample/sentences.json"
-        ),
+        "sentences_path": ("/old/location/youtube-subtitle-md/workspace/sample/sentences.json"),
     }
 
     assert manager._validated_project_file(record["audio_path"], "output") == audio.resolve()
-    assert manager._validated_project_file(
-        record["sentences_path"], "workspace"
-    ) == sentences.resolve()
-    assert manager._public_record(record)["player_url"] == (
-        "/api/player/renamed-project-job"
+    assert (
+        manager._validated_project_file(record["sentences_path"], "workspace")
+        == sentences.resolve()
     )
+    assert manager._public_record(record)["player_url"] == ("/api/player/renamed-project-job")
